@@ -21,8 +21,8 @@ use crate::{
     auth::{auth_token_from_cookie, auth_token_from_creds},
     source::{BitcoinRpc, BitcoinRpcAuth},
     spaces::Spaced,
-    store::{LiveStore, Store},
 };
+use crate::store::chain::Chain;
 
 const RPC_OPTIONS: &str = "RPC Server Options";
 
@@ -196,44 +196,17 @@ impl Args {
 
         let genesis = Spaced::genesis(args.chain);
 
-        let proto_db_path = data_dir.join("protocol.sdb");
-        let initial_sync = !proto_db_path.exists();
-
-        let chain_store = Store::open(proto_db_path)?;
-        let chain = LiveStore {
-            state: chain_store.begin(&genesis)?,
-            store: chain_store,
-        };
+        let chain = Chain::load(
+            args.chain.fallback_network(),
+            genesis,
+            &data_dir,
+            args.block_index || args.block_index_full,
+            args.block_index || args.block_index_full, // TODO: option to index ptrs
+        )?;
 
         let anchors_path = match args.skip_anchors {
             true => None,
             false => Some(data_dir.join("root_anchors.json")),
-        };
-        let block_index_enabled = args.block_index || args.block_index_full;
-        let block_index = if block_index_enabled {
-            let block_db_path = data_dir.join("block_index.sdb");
-            if !initial_sync && !block_db_path.exists() {
-                return Err(anyhow::anyhow!(
-                    "Block index must be enabled from the initial sync."
-                ));
-            }
-            let block_store = Store::open(block_db_path)?;
-            let index = LiveStore {
-                state: block_store.begin(&genesis).expect("begin block index"),
-                store: block_store,
-            };
-            {
-                let tip_1 = index.state.tip.read().expect("index");
-                let tip_2 = chain.state.tip.read().expect("tip");
-                if tip_1.height != tip_2.height || tip_1.hash != tip_2.hash {
-                    return Err(anyhow::anyhow!(
-                        "Protocol and block index states don't match."
-                    ));
-                }
-            }
-            Some(index)
-        } else {
-            None
         };
 
         Ok(Spaced {
@@ -243,7 +216,6 @@ impl Args {
             bind: rpc_bind_addresses,
             auth_token,
             chain,
-            block_index,
             block_index_full: args.block_index_full,
             num_workers: args.jobs as usize,
             anchors_path,

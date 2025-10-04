@@ -27,6 +27,7 @@ pub struct TxContext {
     pub auctioned_output: Option<AuctionedOutput>,
 }
 
+#[derive(Clone)]
 pub struct InputContext {
     pub n: usize,
     pub sstxo: SSTXO,
@@ -34,6 +35,7 @@ pub struct InputContext {
 }
 
 /// Spent Spaces Transaction Output
+#[derive(Clone)]
 pub struct SSTXO {
     pub previous_output: SpaceOut,
 }
@@ -46,7 +48,7 @@ pub struct AuctionedOutput {
     pub bid_psbt: BidPsbt,
 }
 
-pub trait DataSource {
+pub trait SpacesSource {
     fn get_space_outpoint(&mut self, space_hash: &SpaceKey) -> Result<Option<OutPoint>>;
 
     fn get_spaceout(&mut self, outpoint: &OutPoint) -> Result<Option<SpaceOut>>;
@@ -54,7 +56,7 @@ pub trait DataSource {
 
 impl TxContext {
     #[inline(always)]
-    pub fn spending_spaces<T: DataSource>(src: &mut T, tx: &Transaction) -> Result<bool> {
+    pub fn spending_spaces<T: SpacesSource>(src: &mut T, tx: &Transaction) -> Result<bool> {
         for input in tx.input.iter() {
             if src.get_spaceout(&input.previous_output)?.is_some() {
                 return Ok(true);
@@ -69,7 +71,7 @@ impl TxContext {
     ///
     /// Returns `Some(PreparedTransaction)` if the transaction is relevant to the Spaces protocol.
     /// Returns `None` if the transaction is not relevant.
-    pub fn from_tx<T: DataSource, H: KeyHasher>(
+    pub fn from_tx<T: SpacesSource, H: KeyHasher>(
         src: &mut T,
         tx: &Transaction,
     ) -> Result<Option<TxContext>> {

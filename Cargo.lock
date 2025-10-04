@@ -2356,6 +2356,7 @@ dependencies = [
  "serde_json",
  "spacedb",
  "spaces_protocol",
+ "spaces_ptr",
  "spaces_testutil",
  "spaces_wallet",
  "tabled",
@@ -2374,6 +2375,20 @@ dependencies = [
  "rand",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "spaces_ptr"
+version = "0.1.0"
+dependencies = [
+ "bech32",
+ "bincode",
+ "bitcoin",
+ "log",
+ "rand",
+ "serde",
+ "serde_json",
+ "spaces_protocol",
 ]
 
 [[package]]
@@ -2423,6 +2438,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spaces_protocol",
+ "spaces_ptr",
  "tempfile",
 ]
 

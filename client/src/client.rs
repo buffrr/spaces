@@ -15,13 +15,16 @@ use spaces_protocol::{
     validate::{TxChangeSet, UpdateKind, Validator},
     Bytes, Covenant, FullSpaceOut, RevokeReason, SpaceOut,
 };
-use spaces_wallet::bitcoin::{Network, Transaction};
+use spaces_ptr::{CommitmentKey, RegistryKey};
+use spaces_ptr::sptr::Sptr;
+use spaces_wallet::bitcoin::{Network, ScriptBuf, Transaction};
 
 use crate::{
     source::BitcoinRpcError,
-    store::{ChainState, ChainStore, LiveSnapshot, LiveStore, Sha256},
 };
 use crate::source::BlockQueueResult;
+use crate::store::chain::{Chain};
+use crate::store::Sha256;
 
 pub trait BlockSource {
     fn get_block_hash(&self, height: u32) -> Result<BlockHash, BitcoinRpcError>;
@@ -38,10 +41,10 @@ pub trait BlockSource {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockFilterRpc {
-    pub hash:   BlockHash,
+    pub hash: BlockHash,
     pub height: u32,
     #[serde(
-        serialize_with   = "serialize_hex",
+        serialize_with = "serialize_hex",
         deserialize_with = "deserialize_hex"
     )]
     pub content: Vec<u8>,
@@ -76,6 +79,7 @@ pub struct BlockchainInfo {
 #[derive(Debug, Clone)]
 pub struct Client {
     validator: Validator,
+    ptr_validator: spaces_ptr::Validator,
     tx_data: bool,
 }
 
@@ -86,6 +90,22 @@ pub struct BlockMeta {
     pub height: u32,
     pub tx_meta: Vec<TxEntry>,
 }
+
+/// A block structure containing validated transaction metadata for ptrs
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct PtrBlockMeta {
+    pub height: u32,
+    pub tx_meta: Vec<PtrTxEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct PtrTxEntry {
+    #[serde(flatten)]
+    pub changeset: spaces_ptr::TxChangeSet,
+    #[serde(skip_serializing_if = "Option::is_none", flatten)]
+    pub tx: Option<TxData>,
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct TxEntry {
@@ -123,44 +143,75 @@ impl Client {
     pub fn new(tx_data: bool) -> Self {
         Self {
             validator: Validator::new(),
+            ptr_validator: spaces_ptr::Validator::new(),
             tx_data,
         }
     }
 
-    pub fn apply_block(
-        &mut self,
-        chain: &mut LiveStore,
-        height: u32,
-        block_hash: BlockHash,
-        block: Block,
-        get_block_data: bool,
-    ) -> Result<Option<BlockMeta>> {
+    fn verify_block_connected(chain: &mut Chain, height: u32, block_hash: BlockHash, block: &Block) -> anyhow::Result<()> {
+        // Spaces tip must connect to block
         {
-            let tip = chain.state.tip.read().expect("read tip");
+            let tip = chain.tip();
             if tip.hash != block.header.prev_blockhash || tip.height + 1 != height {
                 return Err(SyncError {
                     checkpoint: tip.clone(),
                     connect_to: (height, block_hash),
                 }
-                .into());
+                    .into());
+            }
+        }
+        // Ptrs tip must connect to block
+        {
+            let tip = chain.ptrs_tip();
+            if tip.hash != block.header.prev_blockhash || tip.height + 1 != height {
+                return Err(SyncError {
+                    checkpoint: tip.clone(),
+                    connect_to: (height, block_hash),
+                }
+                    .into());
             }
         }
 
-        let mut block_data = BlockMeta {
-            height,
-            tx_meta: vec![],
-        };
+        Ok(())
+    }
 
+    pub(crate) fn scan_block(
+        &mut self,
+        chain: &mut Chain,
+        height: u32,
+        block_hash: BlockHash,
+        block: &Block,
+        index_spaces: bool,
+        index_ptrs: bool,
+    ) -> anyhow::Result<(Option<BlockMeta>, Option<PtrBlockMeta>)> {
+        Self::verify_block_connected(chain, height, block_hash, block)?;
+
+        let mut spaces_meta = None;
+        if index_spaces {
+            spaces_meta = Some(BlockMeta {
+                height,
+                tx_meta: vec![],
+            });
+        }
+
+        let mut ptr_meta = None;
+        if index_ptrs {
+            ptr_meta = Some(PtrBlockMeta {
+                height,
+                tx_meta: vec![],
+            });
+        }
+
+        // Rollouts:
         if (height - 1) % ROLLOUT_BLOCK_INTERVAL == 0 {
             let batch = Self::get_rollout_batch(ROLLOUT_BATCH_SIZE, chain)?;
             let coinbase = block
                 .coinbase()
                 .expect("expected a coinbase tx to be present in the block")
                 .clone();
-
             let validated = self.validator.rollout(height, &coinbase, batch);
-            if get_block_data {
-                block_data.tx_meta.push(TxEntry {
+            if let Some(idx) = spaces_meta.as_mut() {
+                idx.tx_meta.push(TxEntry {
                     changeset: validated.clone(),
                     tx: if self.tx_data {
                         Some(TxData {
@@ -174,18 +225,19 @@ impl Client {
                     },
                 });
             }
-            self.apply_tx(&mut chain.state, &coinbase, validated);
+            self.apply_space_tx(chain, &coinbase, validated);
         }
 
-        for (position, tx) in block.txdata.into_iter().enumerate() {
-            let prepared_tx =
-                { TxContext::from_tx::<LiveSnapshot, Sha256>(&mut chain.state, &tx)? };
+        for (position, tx) in block.txdata.iter().enumerate() {
+            let mut spaceouts = None;
+            let mut spaceouts_input_ctx = None;
+            if let Some(prepared) = TxContext::from_tx::<Chain, Sha256>(chain, tx)? {
+                spaceouts_input_ctx = Some(prepared.inputs.clone());
+                let validated_tx = self.validator.process(height, &tx, prepared);
+                spaceouts = Some(validated_tx.creates.clone());
 
-            if let Some(prepared_tx) = prepared_tx {
-                let validated_tx = self.validator.process(height, &tx, prepared_tx);
-
-                if get_block_data {
-                    block_data.tx_meta.push(TxEntry {
+                if let Some(idx) = spaces_meta.as_mut() {
+                    idx.tx_meta.push(TxEntry {
                         changeset: validated_tx.clone(),
                         tx: if self.tx_data {
                             Some(TxData {
@@ -199,25 +251,95 @@ impl Client {
                         },
                     });
                 }
-                self.apply_tx(&mut chain.state, &tx, validated_tx);
+                self.apply_space_tx(chain, &tx, validated_tx);
+            }
+
+            let ptrs_ctx =
+                { spaces_ptr::TxContext::from_tx::<Chain, Sha256>(chain, tx, spaceouts.is_some() || spaceouts_input_ctx.is_some())? };
+
+            if let Some(ptrs_ctx) = ptrs_ctx {
+                let spent_spaceouts = spaceouts_input_ctx.unwrap_or_default().into_iter()
+                    .map(|input| input.sstxo.previous_output).collect::<Vec<_>>();
+                let created_spaceouts = spaceouts.unwrap_or_default();
+                let ptrs_validated = self.ptr_validator
+                    .process::<Sha256>(height, &tx, ptrs_ctx, spent_spaceouts, created_spaceouts);
+
+                if let Some(idx) = ptr_meta.as_mut() {
+                    {
+                        idx.tx_meta.push(PtrTxEntry {
+                            changeset: ptrs_validated.clone(),
+                            tx: if self.tx_data {
+                                Some(TxData {
+                                    position: position as u32,
+                                    raw: Bytes::new(
+                                        spaces_protocol::bitcoin::consensus::encode::serialize(&tx),
+                                    ),
+                                })
+                            } else {
+                                None
+                            },
+                        });
+                    }
+                    self.apply_ptrs_tx(chain, tx, ptrs_validated);
+                }
             }
         }
-        let mut tip = chain.state.tip.write().expect("write tip");
-        tip.height = height;
-        tip.hash = block_hash;
 
-        if get_block_data && !block_data.tx_meta.is_empty() {
-            return Ok(Some(block_data));
-        }
-        Ok(None)
+        chain.update_spaces_tip(height, block_hash);
+        chain.update_ptrs_tip(height, block_hash);
+
+        Ok((spaces_meta, ptr_meta))
     }
 
-    fn apply_tx(&self, state: &mut LiveSnapshot, tx: &Transaction, changeset: TxChangeSet) {
+    fn apply_ptrs_tx(&self, state: &mut Chain, tx: &Transaction, changeset: spaces_ptr::TxChangeSet) {
+        // Remove spends
+        for n in changeset.spends.into_iter() {
+            let previous = tx.input[n].previous_output;
+            state.remove_ptr_utxo(previous);
+        }
+
+        // Remove revoked delegations
+        for revoked in changeset.revoked_delegations {
+            state.remove_delegation(revoked);
+        }
+        // Create new delegations
+        for delegation in changeset.new_delegations {
+            state.insert_delegation(delegation.sptr_key, delegation.space);
+        }
+
+        // Insert new commitments
+        for (space, commitment) in changeset.commitments {
+            let commitment_key = CommitmentKey::new::<Sha256>(&space, commitment.state_root);
+            // Points space -> commitments tip
+            state.insert_registry(RegistryKey::from_slabel::<Sha256>(&space), commitment.state_root);
+            // commitment key = HASH(HASH(space) || state root) -> commitment
+            state.insert_commitment(commitment_key, commitment);
+        }
+
+        // Create ptrs
+        for create in changeset.creates.into_iter() {
+            let outpoint = OutPoint {
+                txid: changeset.txid,
+                vout: create.n as u32,
+            };
+
+            // Ptr => Outpoint
+            if let Some(ptr) = create.sptr.as_ref() {
+                let ptr_key = Sptr::from_spk::<Sha256>(ScriptBuf::from(ptr.genesis_spk.clone()));
+                state.insert_ptr(ptr_key, outpoint.into());
+            }
+
+            // Outpoint => PtrOut
+            let outpoint_key = OutpointKey::from_outpoint::<Sha256>(outpoint);
+            state.insert_ptrout(outpoint_key, create);
+        }
+    }
+
+    fn apply_space_tx(&self, state: &mut Chain, tx: &Transaction, changeset: TxChangeSet) {
         // Remove spends
         for spend in changeset.spends.into_iter() {
             let previous = tx.input[spend.n].previous_output;
-            let spend = OutpointKey::from_outpoint::<Sha256>(previous);
-            state.remove(spend);
+            state.remove_space_utxo(previous);
         }
 
         // Apply outputs
@@ -258,7 +380,7 @@ impl Client {
 
                             // Remove Space -> Outpoint
                             let space_key = SpaceKey::from(base_hash);
-                            state.remove(space_key);
+                            state.remove_space(space_key);
 
                             // Remove any bids from pre-auction pool
                             match space.covenant {
@@ -269,7 +391,7 @@ impl Client {
                                 } => {
                                     if claim_height.is_none() {
                                         let bid_key = BidKey::from_bid(total_burned, base_hash);
-                                        state.remove(bid_key);
+                                        state.remove_bid(bid_key)
                                     }
                                 }
                                 _ => {}
@@ -280,9 +402,7 @@ impl Client {
                             // since this type of revocation only happens when an
                             // expired space is being re-opened for auction.
                             // No bids here so only remove Outpoint -> Spaceout
-                            let hash =
-                                OutpointKey::from_outpoint::<Sha256>(update.output.outpoint());
-                            state.remove(hash);
+                            state.remove_space_utxo(update.output.outpoint());
                         }
                     }
                 }
@@ -302,7 +422,7 @@ impl Client {
                     let outpoint_key =
                         OutpointKey::from_outpoint::<Sha256>(update.output.outpoint());
 
-                    state.remove(bid_key);
+                    state.remove_bid(bid_key);
                     state.insert_spaceout(outpoint_key, update.output.spaceout);
                 }
                 UpdateKind::Bid => {
@@ -350,14 +470,14 @@ impl Client {
         }
     }
 
-    fn get_rollout_batch(size: usize, chain: &mut LiveStore) -> Result<Vec<FullSpaceOut>> {
-        let (iter, snapshot) = chain.store.rollout_iter()?;
+    fn get_rollout_batch(size: usize, chain: &mut Chain) -> Result<Vec<FullSpaceOut>> {
+        let (iter, snapshot) = chain.rollout_iter()?;
         assert_eq!(
             snapshot.metadata(),
-            chain.state.inner()?.metadata(),
+            chain.spaces_tip_meatadata()?,
             "rollout snapshots don't match"
         );
-        assert!(!chain.state.is_dirty(), "rollout must begin on clean state");
+        assert!(!chain.is_dirty(), "rollout must begin on clean state");
 
         let mut spaceouts = Vec::with_capacity(size);
 
@@ -367,7 +487,7 @@ impl Client {
             hash.copy_from_slice(raw_hash.as_slice());
 
             let space_hash = SpaceKey::from_raw(hash)?;
-            let full = chain.state.get_space_info(&space_hash)?;
+            let full = chain.get_space_info(&space_hash)?;
 
             if let Some(full) = full {
                 match full.spaceout.space.as_ref().unwrap().covenant {
@@ -397,7 +517,6 @@ fn unwrap_bid_value(spaceout: &SpaceOut) -> (Amount, Amount) {
     }
     panic!("expected a bid covenant")
 }
-
 
 fn serialize_hex<S>(bytes: &Vec<u8>, s: S) -> std::result::Result<S::Ok, S::Error>
 where

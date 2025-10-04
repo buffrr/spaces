@@ -17,10 +17,10 @@ pub mod format;
 pub mod rpc;
 pub mod source;
 pub mod store;
-pub mod spaces;
 pub mod wallets;
 mod cbf;
 pub mod app;
+mod spaces;
 
 fn std_wait<F>(mut predicate: F, wait: Duration)
 where

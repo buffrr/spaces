@@ -31,8 +31,8 @@ use spaces_protocol::{
         OutPoint,
     },
     constants::ChainAnchor,
-    hasher::{BaseHash, KeyHasher, OutpointKey, SpaceKey},
-    prepare::DataSource,
+    hasher::{KeyHasher, OutpointKey, SpaceKey},
+    prepare::SpacesSource,
     slabel::SLabel,
     validate::TxChangeSet,
     Bytes, Covenant, FullSpaceOut, SpaceOut,
@@ -47,7 +47,10 @@ use tokio::{
     sync::{broadcast, mpsc, oneshot, RwLock},
     task::JoinSet,
 };
-
+use spaces_protocol::hasher::Hash;
+use spaces_ptr::{PtrSource, FullPtrOut, PtrOut, Commitment, RegistryKey, CommitmentKey, RegistrySptrKey};
+use spaces_ptr::sptr::Sptr;
+use spaces_wallet::bitcoin::hashes::sha256;
 use crate::auth::BasicAuthLayer;
 use crate::wallets::WalletInfoWithProgress;
 use crate::{
@@ -57,13 +60,14 @@ use crate::{
     config::ExtendedNetwork,
     deserialize_base64, serialize_base64,
     source::BitcoinRpc,
-    spaces::{COMMIT_BLOCK_INTERVAL, ROOT_ANCHORS_COUNT},
-    store::{ChainState, LiveSnapshot, RolloutEntry, Sha256},
     wallets::{
         AddressKind, ListSpacesResponse, RpcWallet, TxInfo, TxResponse, WalletCommand,
         WalletResponse,
     },
 };
+use crate::store::chain::{Chain, COMMIT_BLOCK_INTERVAL, ROOT_ANCHORS_COUNT};
+use crate::store::Sha256;
+use crate::store::spaces::RolloutEntry;
 
 pub(crate) type Responder<T> = oneshot::Sender<T>;
 
@@ -75,6 +79,7 @@ pub struct ServerInfo {
     pub ready: bool,
     pub progress: f32,
 }
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainInfo {
@@ -126,6 +131,31 @@ pub enum ChainStateCommand {
         hash: SpaceKey,
         resp: Responder<anyhow::Result<Option<OutPoint>>>,
     },
+    GetCommitment {
+        space: SLabel,
+        root: Option<Hash>,
+        resp: Responder<anyhow::Result<Option<Commitment>>>,
+    },
+    GetDelegation {
+        space: SLabel,
+        resp: Responder<anyhow::Result<Option<Sptr>>>,
+    },
+    GetDelegator {
+        sptr: Sptr,
+        resp: Responder<anyhow::Result<Option<SLabel>>>,
+    },
+    GetPtr {
+        hash: Sptr,
+        resp: Responder<anyhow::Result<Option<FullPtrOut>>>,
+    },
+    GetPtrOutpoint {
+        hash: Sptr,
+        resp: Responder<anyhow::Result<Option<OutPoint>>>,
+    },
+    GetPtrOut {
+        outpoint: OutPoint,
+        resp: Responder<anyhow::Result<Option<PtrOut>>>,
+    },
     GetTxMeta {
         txid: Txid,
         resp: Responder<anyhow::Result<Option<TxEntry>>>,
@@ -170,6 +200,7 @@ pub struct AsyncChainState {
     sender: mpsc::Sender<ChainStateCommand>,
 }
 
+
 #[rpc(server, client)]
 pub trait Rpc {
     #[method(name = "getserverinfo")]
@@ -189,6 +220,30 @@ pub trait Rpc {
 
     #[method(name = "getspaceout")]
     async fn get_spaceout(&self, outpoint: OutPoint) -> Result<Option<SpaceOut>, ErrorObjectOwned>;
+
+    #[method(name = "getptr")]
+    async fn get_ptr(
+        &self,
+        ptr: Sptr,
+    ) -> Result<Option<FullPtrOut>, ErrorObjectOwned>;
+
+    #[method(name = "getptrowner")]
+    async fn get_ptr_owner(
+        &self,
+        ptr: Sptr,
+    ) -> Result<Option<OutPoint>, ErrorObjectOwned>;
+
+    #[method(name = "getptrout")]
+    async fn get_ptrout(&self, outpoint: OutPoint) -> Result<Option<PtrOut>, ErrorObjectOwned>;
+
+    #[method(name = "getcommitment")]
+    async fn get_commitment(&self, space: SLabel, root: Option<sha256::Hash>) -> Result<Option<Commitment>, ErrorObjectOwned>;
+
+    #[method(name = "getdelegation")]
+    async fn get_delegation(&self, space: SLabel) -> Result<Option<Sptr>, ErrorObjectOwned>;
+
+    #[method(name = "getdelegator")]
+    async fn get_delegator(&self, sptr: Sptr) -> Result<Option<SLabel>, ErrorObjectOwned>;
 
     #[method(name = "checkpackage")]
     async fn check_package(
@@ -237,7 +292,7 @@ pub trait Rpc {
 
     #[method(name = "walletgetinfo")]
     async fn wallet_get_info(&self, name: &str)
-        -> Result<WalletInfoWithProgress, ErrorObjectOwned>;
+                             -> Result<WalletInfoWithProgress, ErrorObjectOwned>;
 
     #[method(name = "walletexport")]
     async fn wallet_export(&self, name: &str) -> Result<WalletExport, ErrorObjectOwned>;
@@ -367,6 +422,12 @@ pub enum RpcWalletRequest {
     Execute(ExecuteParams),
     #[serde(rename = "transfer")]
     Transfer(TransferSpacesParams),
+    #[serde(rename = "transferptr")]
+    TransferPtr(TransferPtrParams),
+    #[serde(rename = "createptr")]
+    CreatePtr(CreatePtrParams),
+    #[serde(rename = "commit")]
+    Commit(CommitParams),
     #[serde(rename = "send")]
     SendCoins(SendCoinsParams),
 }
@@ -377,6 +438,23 @@ pub struct TransferSpacesParams {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct TransferPtrParams {
+    pub ptrs: Vec<Sptr>,
+    pub to: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CreatePtrParams {
+    pub address: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CommitParams {
+    pub space: SLabel,
+    pub root: sha256::Hash,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -815,6 +893,61 @@ impl RpcServer for RpcServerImpl {
         Ok(spaceout)
     }
 
+    async fn get_ptr(&self, sptr: Sptr) -> Result<Option<FullPtrOut>, ErrorObjectOwned> {
+        let info = self
+            .store
+            .get_ptr(sptr)
+            .await
+            .map_err(|error| ErrorObjectOwned::owned(-1, error.to_string(), None::<String>))?;
+        Ok(info)
+    }
+
+    async fn get_ptr_owner(&self, sptr: Sptr) -> Result<Option<OutPoint>, ErrorObjectOwned> {
+        let info = self
+            .store
+            .get_ptr_outpoint(sptr)
+            .await
+            .map_err(|error| ErrorObjectOwned::owned(-1, error.to_string(), None::<String>))?;
+        Ok(info)
+    }
+
+    async fn get_ptrout(&self, outpoint: OutPoint) -> Result<Option<PtrOut>, ErrorObjectOwned> {
+        let spaceout = self
+            .store
+            .get_ptrout(outpoint)
+            .await
+            .map_err(|error| ErrorObjectOwned::owned(-1, error.to_string(), None::<String>))?;
+        Ok(spaceout)
+    }
+
+    async fn get_commitment(&self, space: SLabel, root: Option<sha256::Hash>) -> Result<Option<Commitment>, ErrorObjectOwned> {
+        let c = self
+            .store
+            .get_commitment(space, root.map(|r| *r.as_ref()))
+            .await
+            .map_err(|error| ErrorObjectOwned::owned(-1, error.to_string(), None::<String>))?;
+        Ok(c)
+    }
+
+    async fn get_delegation(&self, space: SLabel) -> Result<Option<Sptr>, ErrorObjectOwned> {
+        let delegation = self
+            .store
+            .get_delegation(space)
+            .await
+            .map_err(|error| ErrorObjectOwned::owned(-1, error.to_string(), None::<String>))?;
+        Ok(delegation)
+    }
+
+    async fn get_delegator(&self, sptr: Sptr) -> Result<Option<SLabel>, ErrorObjectOwned> {
+        let delegator = self
+            .store
+            .get_delegator(sptr)
+            .await
+            .map_err(|error| ErrorObjectOwned::owned(-1, error.to_string(), None::<String>))?;
+        Ok(delegator)
+    }
+
+
     async fn check_package(
         &self,
         txs: Vec<String>,
@@ -1126,11 +1259,10 @@ impl AsyncChainState {
     }
 
     async fn get_indexed_tx(
-        index: &mut Option<LiveSnapshot>,
+        state: &mut Chain,
         txid: &Txid,
         client: &reqwest::Client,
         rpc: &BitcoinRpc,
-        chain_state: &mut LiveSnapshot,
     ) -> Result<Option<TxEntry>, anyhow::Error> {
         let info: serde_json::Value = rpc
             .send_json(client, &rpc.get_raw_transaction(&txid, true))
@@ -1142,13 +1274,12 @@ impl AsyncChainState {
                 || anyhow!("Could not retrieve block hash for tx (is it in the mempool?)"),
             )?)?;
         let block = Self::get_indexed_block(
-            index,
+            state,
             HeightOrHash::Hash(block_hash),
             client,
             rpc,
-            chain_state,
         )
-        .await?;
+            .await?;
 
         Ok(block
             .block_meta
@@ -1158,15 +1289,14 @@ impl AsyncChainState {
     }
 
     async fn get_indexed_block(
-        index: &mut Option<LiveSnapshot>,
+        state: &mut Chain,
         height_or_hash: HeightOrHash,
         client: &reqwest::Client,
         rpc: &BitcoinRpc,
-        chain_state: &mut LiveSnapshot,
     ) -> Result<BlockMetaWithHash, anyhow::Error> {
-        let index = index
-            .as_mut()
-            .ok_or_else(|| anyhow!("block index must be enabled"))?;
+        // let index = state
+        //     .as_mut()
+        //     .ok_or_else(|| anyhow!("block index must be enabled"))?;
         let hash = match height_or_hash {
             HeightOrHash::Hash(hash) => hash,
             HeightOrHash::Height(height) => rpc
@@ -1175,11 +1305,8 @@ impl AsyncChainState {
                 .map_err(|e| anyhow!("Could not retrieve block hash ({})", e))?,
         };
 
-        if let Some(block_meta) = index
-            .get(BaseHash::from_slice(hash.as_ref()))
-            .context("Could not fetch block from index")?
-        {
-            return Ok(BlockMetaWithHash { hash, block_meta });
+        if let Some(block_meta) = state.get_spaces_block(hash)? {
+            return Ok(block_meta);
         }
 
         let info: serde_json::Value = rpc
@@ -1193,7 +1320,7 @@ impl AsyncChainState {
             .and_then(|h| u32::try_from(h).ok())
             .ok_or_else(|| anyhow!("Could not retrieve block height"))?;
 
-        let tip = chain_state.tip.read().expect("read meta").clone();
+        let tip = state.tip();
         if height > tip.height {
             return Err(anyhow!(
                 "Spaces is syncing at height {}, requested block height {}",
@@ -1214,8 +1341,7 @@ impl AsyncChainState {
         client: &reqwest::Client,
         rpc: &BitcoinRpc,
         anchors_path: &Option<PathBuf>,
-        chain_state: &mut LiveSnapshot,
-        block_index: &mut Option<LiveSnapshot>,
+        state: &mut Chain,
         cmd: ChainStateCommand,
     ) {
         match cmd {
@@ -1230,29 +1356,58 @@ impl AsyncChainState {
                     txs.push(tx.unwrap());
                 }
 
-                let tip = chain_state.tip.read().expect("read meta").clone();
-                let mut emulator = TxChecker::new(chain_state);
+                let tip = state.tip();
+                let mut emulator = TxChecker::new(state);
                 let result = emulator.apply_package(tip.height + 1, txs);
                 let _ = resp.send(result);
             }
             ChainStateCommand::GetServerInfo { resp } => {
-                let tip = chain_state.tip.read().expect("read meta").clone();
+                let tip = state.tip();
                 _ = resp.send(get_server_info(client, rpc, tip).await)
             }
             ChainStateCommand::GetSpace { hash, resp } => {
-                let result = chain_state.get_space_info(&hash);
+                let result = state.get_space_info(&hash);
                 let _ = resp.send(result);
             }
             ChainStateCommand::GetSpaceout { outpoint, resp } => {
-                let result = chain_state
+                let result = state
                     .get_spaceout(&outpoint)
                     .context("could not fetch spaceout");
                 let _ = resp.send(result);
             }
             ChainStateCommand::GetSpaceOutpoint { hash, resp } => {
-                let result = chain_state
+                let result = state
                     .get_space_outpoint(&hash)
                     .context("could not fetch spaceout");
+                let _ = resp.send(result);
+            }
+            ChainStateCommand::GetPtr { hash, resp } => {
+                let result = state.get_ptr_info(&hash);
+                let _ = resp.send(result);
+            }
+            ChainStateCommand::GetPtrOutpoint { hash, resp } => {
+                let result = state
+                    .get_ptr_outpoint(&hash)
+                    .context("could not fetch ptrout");
+                let _ = resp.send(result);
+            }
+            ChainStateCommand::GetCommitment { space, root, resp } => {
+                let result = get_commitment(state, space, root);
+                let _ = resp.send(result);
+            }
+            ChainStateCommand::GetDelegation { space, resp } => {
+                let result = get_delegation(state, space);
+                let _ = resp.send(result);
+            }
+            ChainStateCommand::GetDelegator { sptr, resp } => {
+                let result = state
+                    .get_delegator(&RegistrySptrKey::from_sptr::<Sha256>(sptr)).map_err(|e| anyhow!("could not get delegator: {}", e));
+                let _ = resp.send(result);
+            }
+            ChainStateCommand::GetPtrOut { outpoint, resp } => {
+                let result = state
+                    .get_ptrout(&outpoint)
+                    .context("could not fetch ptrouts");
                 let _ = resp.send(result);
             }
             ChainStateCommand::GetBlockMeta {
@@ -1260,30 +1415,30 @@ impl AsyncChainState {
                 resp,
             } => {
                 let res =
-                    Self::get_indexed_block(block_index, height_or_hash, client, rpc, chain_state)
+                    Self::get_indexed_block(state, height_or_hash, client, rpc)
                         .await;
                 let _ = resp.send(res);
             }
             ChainStateCommand::GetTxMeta { txid, resp } => {
-                let res = Self::get_indexed_tx(block_index, &txid, client, rpc, chain_state).await;
+                let res = Self::get_indexed_tx(state, &txid, client, rpc).await;
                 let _ = resp.send(res);
             }
             ChainStateCommand::EstimateBid { target, resp } => {
-                let estimate = chain_state.estimate_bid(target);
+                let estimate = state.estimate_bid(target);
                 _ = resp.send(estimate);
             }
             ChainStateCommand::GetRollout { target, resp } => {
-                let rollouts = chain_state.get_rollout(target);
+                let rollouts = state.get_rollout(target);
                 _ = resp.send(rollouts);
             }
             ChainStateCommand::VerifyListing { listing, resp } => {
                 _ = resp.send(
-                    SpacesWallet::verify_listing::<Sha256>(chain_state, &listing).map(|_| ()),
+                    SpacesWallet::verify_listing::<Sha256>(state, &listing).map(|_| ()),
                 );
             }
             ChainStateCommand::VerifyEvent { space, event, resp } => {
                 _ = resp.send(SpacesWallet::verify_event::<Sha256>(
-                    chain_state,
+                    state,
                     &space,
                     event,
                 ));
@@ -1294,7 +1449,7 @@ impl AsyncChainState {
                 resp,
             } => {
                 _ = resp.send(Self::handle_prove_spaceout(
-                    chain_state,
+                    state,
                     outpoint,
                     prefer_recent,
                 ));
@@ -1304,30 +1459,30 @@ impl AsyncChainState {
                 resp,
             } => {
                 _ = resp.send(Self::handle_prove_space_outpoint(
-                    chain_state,
+                    state,
                     &space_or_hash,
                 ));
             }
             ChainStateCommand::GetRootAnchors { resp } => {
-                _ = resp.send(Self::handle_get_anchor(anchors_path, chain_state));
+                _ = resp.send(Self::handle_get_anchor(anchors_path, state));
             }
         }
     }
 
     fn handle_get_anchor(
         anchors_path: &Option<PathBuf>,
-        state: &mut LiveSnapshot,
+        state: &mut Chain,
     ) -> anyhow::Result<Vec<RootAnchor>> {
         if let Some(anchors_path) = anchors_path {
             let anchors: Vec<RootAnchor> = serde_json::from_reader(
                 File::open(anchors_path)
                     .or_else(|e| Err(anyhow!("Could not open anchors file: {}", e)))?,
             )
-            .or_else(|e| Err(anyhow!("Could not read anchors file: {}", e)))?;
+                .or_else(|e| Err(anyhow!("Could not read anchors file: {}", e)))?;
             return Ok(anchors);
         }
 
-        let snapshot = state.inner()?;
+        let snapshot = state.spaces_inner()?;
         let root = snapshot.compute_root()?;
         let meta: ChainAnchor = snapshot.metadata().try_into()?;
         Ok(vec![RootAnchor {
@@ -1340,11 +1495,11 @@ impl AsyncChainState {
     }
 
     fn handle_prove_space_outpoint(
-        state: &mut LiveSnapshot,
+        state: &mut Chain,
         space_or_hash: &str,
     ) -> anyhow::Result<ProofResult> {
         let key = get_space_key(space_or_hash)?;
-        let snapshot = state.inner()?;
+        let snapshot = state.spaces_inner()?;
 
         // warm up hash cache
         let root = snapshot.compute_root()?;
@@ -1391,7 +1546,7 @@ impl AsyncChainState {
     }
 
     fn handle_prove_spaceout(
-        state: &mut LiveSnapshot,
+        state: &mut Chain,
         outpoint: OutPoint,
         prefer_recent: bool,
     ) -> anyhow::Result<ProofResult> {
@@ -1410,16 +1565,16 @@ impl AsyncChainState {
                 None => return Ok(ProofResult { proof: vec![], root: Bytes::new(vec![]) }),
                 Some(space) => match space.covenant {
                     Covenant::Transfer { expire_height, .. } => {
-                        let tip = state.tip.read().expect("read lock").height;
+                        let tip = state.tip();
                         let last_update = expire_height.saturating_sub(spaces_protocol::constants::RENEWAL_INTERVAL);
-                        Self::compute_target_snapshot(last_update, tip)
+                        Self::compute_target_snapshot(last_update, tip.height)
                     }
                     _ => return Err(anyhow!("Cannot find older proofs for a non-registered space (try with oldest: false)")),
                 }
             };
-            state.prove_with_snapshot(&[key.into()], target_snapshot)?
+            state.prove_spaces_with_snapshot(&[key.into()], target_snapshot)?
         } else {
-            let snapshot = state.inner()?;
+            let snapshot = state.spaces_inner()?;
             snapshot.prove(&[key.into()], ProofType::Standard)?
         };
 
@@ -1439,8 +1594,7 @@ impl AsyncChainState {
         client: &reqwest::Client,
         rpc: BitcoinRpc,
         anchors_path: Option<PathBuf>,
-        mut chain_state: LiveSnapshot,
-        mut block_index: Option<LiveSnapshot>,
+        mut state: Chain,
         mut rx: mpsc::Receiver<ChainStateCommand>,
         mut shutdown: broadcast::Receiver<()>,
     ) {
@@ -1450,7 +1604,7 @@ impl AsyncChainState {
                      break;
                 }
                 Some(cmd) = rx.recv() => {
-                    Self::handle_command(client, &rpc, &anchors_path, &mut chain_state, &mut block_index, cmd).await;
+                    Self::handle_command(client, &rpc, &anchors_path, &mut state, cmd).await;
                 }
             }
         }
@@ -1537,10 +1691,26 @@ impl AsyncChainState {
         resp_rx.await?
     }
 
+    pub async fn get_ptr(&self, hash: Sptr) -> anyhow::Result<Option<FullPtrOut>> {
+        let (resp, resp_rx) = oneshot::channel();
+        self.sender
+            .send(ChainStateCommand::GetPtr { hash, resp })
+            .await?;
+        resp_rx.await?
+    }
+
     pub async fn get_space_outpoint(&self, hash: SpaceKey) -> anyhow::Result<Option<OutPoint>> {
         let (resp, resp_rx) = oneshot::channel();
         self.sender
             .send(ChainStateCommand::GetSpaceOutpoint { hash, resp })
+            .await?;
+        resp_rx.await?
+    }
+
+    pub async fn get_ptr_outpoint(&self, hash: Sptr) -> anyhow::Result<Option<OutPoint>> {
+        let (resp, resp_rx) = oneshot::channel();
+        self.sender
+            .send(ChainStateCommand::GetPtrOutpoint { hash, resp })
             .await?;
         resp_rx.await?
     }
@@ -1568,6 +1738,38 @@ impl AsyncChainState {
         let (resp, resp_rx) = oneshot::channel();
         self.sender
             .send(ChainStateCommand::GetSpaceout { outpoint, resp })
+            .await?;
+        resp_rx.await?
+    }
+
+    pub async fn get_ptrout(&self, outpoint: OutPoint) -> anyhow::Result<Option<PtrOut>> {
+        let (resp, resp_rx) = oneshot::channel();
+        self.sender
+            .send(ChainStateCommand::GetPtrOut { outpoint, resp })
+            .await?;
+        resp_rx.await?
+    }
+
+    pub async fn get_commitment(&self, space: SLabel, root: Option<Hash>) -> anyhow::Result<Option<Commitment>> {
+        let (resp, resp_rx) = oneshot::channel();
+        self.sender
+            .send(ChainStateCommand::GetCommitment { space, root, resp })
+            .await?;
+        resp_rx.await?
+    }
+
+    pub async fn get_delegation(&self, space: SLabel) -> anyhow::Result<Option<Sptr>> {
+        let (resp, resp_rx) = oneshot::channel();
+        self.sender
+            .send(ChainStateCommand::GetDelegation { space, resp })
+            .await?;
+        resp_rx.await?
+    }
+
+    pub async fn get_delegator(&self, sptr: Sptr) -> anyhow::Result<Option<SLabel>> {
+        let (resp, resp_rx) = oneshot::channel();
+        self.sender
+            .send(ChainStateCommand::GetDelegator { sptr, resp })
             .await?;
         resp_rx.await?
     }
@@ -1652,4 +1854,37 @@ async fn get_server_info(
         ready: info.headers_synced.unwrap_or(true),
         progress: calc_progress(start_block, tip.height, info.headers),
     })
+}
+
+
+fn get_delegation(state: &mut Chain, space: SLabel) -> anyhow::Result<Option<Sptr>> {
+    let info = match state.get_space_info(&SpaceKey::from(Sha256::hash(space.as_ref())))? {
+        None => return Ok(None),
+        Some(info) => info
+    };
+    let sptr = Sptr::from_spk::<Sha256>(info.spaceout.script_pubkey);
+    let delegate = state.get_delegator(&RegistrySptrKey::from_sptr::<Sha256>(sptr))?;
+    Ok(delegate.map(|_| sptr))
+}
+
+fn get_commitment(state: &mut Chain, space: SLabel, root: Option<Hash>) -> anyhow::Result<Option<Commitment>> {
+    let root = match root {
+        None => {
+            let rk = RegistryKey::from_slabel::<Sha256>(&space);
+            let k = state.get_commitments_tip(&rk)
+                    .map_err(|e| anyhow!("could not fetch state root: {}", e))?;
+            if let Some(k) = k {
+                k
+            } else {
+                return Ok(None);
+            }
+        }
+        Some(r) => r,
+    };
+
+    let ck = CommitmentKey::new::<Sha256>(&space, root);
+    state.get_commitment(&ck)
+        .map_err(|e|
+            anyhow!("could not fetch commitment with root: {}: {}", hex::encode(root), e)
+        )
 }

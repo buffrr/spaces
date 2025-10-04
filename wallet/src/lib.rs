@@ -42,7 +42,7 @@ use spaces_protocol::{
     },
     constants::{BID_PSBT_INPUT_SEQUENCE, BID_PSBT_TX_LOCK_TIME},
     hasher::{KeyHasher, SpaceKey},
-    prepare::{is_magic_lock_time, DataSource, TrackableOutput},
+    prepare::{is_magic_lock_time, SpacesSource, TrackableOutput},
     slabel::SLabel,
     Covenant, FullSpaceOut, Space,
 };
@@ -305,7 +305,7 @@ impl SpacesWallet {
 
     pub fn list_spaces_outpoints(
         &self,
-        src: &mut impl DataSource,
+        src: &mut impl SpacesSource,
     ) -> anyhow::Result<Vec<OutPoint>> {
         let mut outs = Vec::new();
         for unspent in self.list_unspent() {
@@ -394,7 +394,7 @@ impl SpacesWallet {
 
     pub fn sign_event<H: KeyHasher>(
         &mut self,
-        src: &mut impl DataSource,
+        src: &mut impl SpacesSource,
         space: &str,
         mut event: NostrEvent,
     ) -> anyhow::Result<NostrEvent> {
@@ -422,7 +422,7 @@ impl SpacesWallet {
     }
 
     pub fn verify_event<H: KeyHasher>(
-        src: &mut impl DataSource,
+        src: &mut impl SpacesSource,
         space: &str,
         mut event: NostrEvent,
     ) -> anyhow::Result<NostrEvent> {
@@ -469,7 +469,7 @@ impl SpacesWallet {
 
     pub fn list_unspent_with_details(
         &mut self,
-        store: &mut impl DataSource,
+        store: &mut impl SpacesSource,
     ) -> anyhow::Result<Vec<WalletOutput>> {
         let mut wallet_outputs = Vec::new();
         for output in self.internal.list_unspent() {
@@ -495,7 +495,7 @@ impl SpacesWallet {
         &mut self,
         mem: impl Mempool,
         height: u32,
-        data_source: &mut impl DataSource,
+        data_source: &mut impl SpacesSource,
     ) -> anyhow::Result<Vec<Txid>> {
         let unconfirmed_bids = self.unconfirmed_bids()?;
         let mut revert_txs = Vec::new();
@@ -743,7 +743,7 @@ impl SpacesWallet {
 
     pub fn buy<H: KeyHasher>(
         &mut self,
-        src: &mut impl DataSource,
+        src: &mut impl SpacesSource,
         listing: &Listing,
         fee_rate: FeeRate,
     ) -> anyhow::Result<Transaction> {
@@ -796,7 +796,7 @@ impl SpacesWallet {
     }
 
     pub fn verify_listing<H: KeyHasher>(
-        src: &mut impl DataSource,
+        src: &mut impl SpacesSource,
         listing: &Listing,
     ) -> anyhow::Result<(SpaceAddress, FullSpaceOut)> {
         let label = SLabel::from_str(&listing.space)?;
@@ -887,7 +887,7 @@ impl SpacesWallet {
 
     pub fn sell<H: KeyHasher>(
         &mut self,
-        src: &mut impl DataSource,
+        src: &mut impl SpacesSource,
         space: &str,
         asking_price: Amount,
     ) -> anyhow::Result<Listing> {
