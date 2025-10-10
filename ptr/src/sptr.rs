@@ -11,10 +11,6 @@ impl KeyHash for Sptr {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Sptr(pub(crate) [u8; 32]);
 
-// COMMITMENT_KEY
-// SPTR_KEY
-// SPACE_KEY
-
 impl Sptr {
     #[inline]
     pub fn as_slice(&self) -> &[u8] { &self.0 }

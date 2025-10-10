@@ -1144,18 +1144,18 @@ async fn handle_commands(cli: &SpaceCli, command: Commands) -> Result<(), Client
                 false,
             )
                 .await?;
-
+            let addr = SpaceAddress::from_str(&sptr_addr).expect("valid");
             println!("Creating UTXO for sptr {}", sptr);
             cli.send_request(
                 Some(RpcWalletRequest::CreatePtr(CreatePtrParams {
-                    address: sptr_addr,
+                    address: addr.0.to_string(),
                 })),
                 None,
                 fee_rate,
                 false,
             )
                 .await?;
-            println!("Space should be operational was txs are confirmed");
+            println!("Space should be operational once txs are confirmed");
         }
         Commands::Commit { space, root, fee_rate } => {
             let space_info = match cli.client.get_space(&space).await? {

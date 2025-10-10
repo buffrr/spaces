@@ -14,14 +14,40 @@ $ space-cli operate @bitcoin
 
 Use [subs](https://github.com/spacesprotocol/subs) to issue subspaces off-chain and create commitments.
 
+
+An **end-user** can generate a key pair like this:
+
+```
+$ subs request alice@bitcoin
+✔ Created handle request
+   → alice@bitcoin.req.json
+   → Private key saved: alice@bitcoin.priv
+```
+
+An **operator** such as @bitcoin, can accept requests into their tree:
+
+```
+$ subs add alice@bitcoin.req.json
+```
+
+
+For this example, we will commit just one handle, but it's more efficient to add a large batch of handles before making a commitment.
+
+```
+$ subs commit
+✔ Committed batch
+   → Tree root: 79d39952ac5a8d6daedd48e59c0a58d12d10644c09f2fa3c70e9fe76e72f866a
+```
+
+
 ### 3. Submit Commitments
 
-Submit a commitment for your space with a Merkle root. Each commitment is cryptographically bound to all previous commitments.
+After your tree is updated, commit it's root hash. Each commitment is cryptographically bound to all previous commitments you made on-chain.
 
-**Example:** To submit a commitment for `@bitcoin` with root hash `85d3a410db41b317b7c0310df64cefb6504482c0b5c7e8a36c992ed0dfdb38af`:
+**Example:** To submit a commitment for `@bitcoin` with root hash `79d39952ac5a8d6daedd48e59c0a58d12d10644c09f2fa3c70e9fe76e72f866a`:
 
 ```bash
-$ space-cli commit @bitcoin 85d3a410db41b317b7c0310df64cefb6504482c0b5c7e8a36c992ed0dfdb38af
+$ space-cli commit @bitcoin 79d39952ac5a8d6daedd48e59c0a58d12d10644c09f2fa3c70e9fe76e72f866a
 ```
 
 **Retrieve commitments** for a space:
@@ -29,6 +55,7 @@ $ space-cli commit @bitcoin 85d3a410db41b317b7c0310df64cefb6504482c0b5c7e8a36c99
 ```bash
 $ space-cli getcommitment @bitcoin
 ```
+
 
 ### Delegating Operational Control
 
