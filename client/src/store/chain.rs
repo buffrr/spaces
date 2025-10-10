@@ -124,7 +124,7 @@ impl Chain {
         let mut pt_idx = None;
         if index_ptrs {
             let current_tip = pt.state.tip.read().expect("tip");
-            pt_idx = Some(load_pt_index(dir, genesis, *current_tip, initial_pt_sync)?)
+            pt_idx = Some(load_pt_index(dir, ptrs_genesis, *current_tip, initial_pt_sync)?)
         }
 
         let chain = Chain {
