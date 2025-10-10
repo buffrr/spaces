@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     hasher::{KeyHasher, SpaceKey},
-    prepare::DataSource,
+    prepare::SpacesSource,
     slabel::{SLabel, SLabelRef},
     validate::RejectParams,
     FullSpaceOut,
@@ -100,7 +100,7 @@ impl SpaceScript {
             .push_opcode(OP_DROP)
     }
 
-    pub fn eval<T: DataSource, H: KeyHasher>(
+    pub fn eval<T: SpacesSource, H: KeyHasher>(
         src: &mut T,
         script: &Script,
     ) -> crate::errors::Result<Option<ScriptResult<Self>>> {
@@ -129,7 +129,7 @@ impl SpaceScript {
         }
     }
 
-    fn op_open<T: DataSource, H: KeyHasher>(
+    fn op_open<T: SpacesSource, H: KeyHasher>(
         src: &mut T,
         op_data: &[u8],
     ) -> crate::errors::Result<ScriptResult<OpenHistory>> {
@@ -208,7 +208,7 @@ mod tests {
 
     use crate::{
         hasher::{Hash, KeyHasher, SpaceKey},
-        prepare::DataSource,
+        prepare::SpacesSource,
         script::{OpenHistory, ScriptError, SpaceScript, MAGIC, MAGIC_LEN, OP_OPEN},
         slabel::SLabel,
         Covenant, FullSpaceOut, Space, SpaceOut,
@@ -260,7 +260,7 @@ mod tests {
             );
         }
     }
-    impl DataSource for DummySource {
+    impl SpacesSource for DummySource {
         fn get_space_outpoint(
             &mut self,
             space_hash: &SpaceKey,

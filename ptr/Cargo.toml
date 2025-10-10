@@ -1,0 +1,26 @@
+[package]
+name = "spaces_ptr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bitcoin = { version = "0.32.2", features = ["base64", "serde"], default-features = false }
+log = "0.4.14"
+spaces_protocol = {path = "../protocol"}
+
+## optional features
+bincode = { version = "2.0.1", features = [ "derive", "serde", "alloc" ], default-features = false, optional = true }
+serde = { version = "^1.0", features = ["derive"], default-features = false, optional = true }
+bech32 = { version = "0.11.0", optional = true }
+
+[dev-dependencies]
+rand = "0.8.5"
+serde_json = "1.0.132"
+
+[features]
+default = ["std"]
+serde = ["dep:serde"]
+bincode = ["dep:bincode"]
+bech32 = ["dep:bech32"]
+std = ["serde", "bincode", "bech32"]
+

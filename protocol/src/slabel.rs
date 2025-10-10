@@ -1,4 +1,3 @@
-#[cfg(feature = "serde")]
 use alloc::string::ToString;
 use alloc::{string::String, vec::Vec};
 use core::{

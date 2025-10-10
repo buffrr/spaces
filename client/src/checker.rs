@@ -4,21 +4,22 @@ use anyhow::anyhow;
 use spaces_protocol::{
     bitcoin::{OutPoint, Transaction},
     hasher::{KeyHasher, SpaceKey},
-    prepare::{DataSource, TxContext},
+    prepare::{SpacesSource, TxContext},
     validate::{TxChangeSet, UpdateKind, Validator},
     Covenant, RevokeReason, SpaceOut,
 };
 
-use crate::store::{LiveSnapshot, Sha256};
+use crate::store::chain::Chain;
+use crate::store::Sha256;
 
 pub struct TxChecker<'a> {
-    pub original: &'a mut LiveSnapshot,
+    pub original: &'a mut Chain,
     pub spaces: BTreeMap<SpaceKey, Option<OutPoint>>,
     pub spaceouts: BTreeMap<OutPoint, Option<SpaceOut>>,
 }
 
 impl<'a> TxChecker<'a> {
-    pub fn new(snap: &'a mut LiveSnapshot) -> Self {
+    pub fn new(snap: &'a mut Chain) -> Self {
         Self {
             original: snap,
             spaces: Default::default(),
@@ -143,7 +144,7 @@ impl<'a> TxChecker<'a> {
     }
 }
 
-impl DataSource for TxChecker<'_> {
+impl SpacesSource for TxChecker<'_> {
     fn get_space_outpoint(
         &mut self,
         space_hash: &SpaceKey,

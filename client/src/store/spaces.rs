@@ -17,18 +17,22 @@ use spacedb::{
     db::{Database, SnapshotIterator},
     fs::FileBackend,
     subtree::SubTree,
-    tx::{KeyIterator, ProofType, ReadTransaction, WriteTransaction},
-    Configuration, Hash, NodeHasher, Sha256Hasher,
+    tx::{KeyIterator, ProofType},
+    Configuration, Hash, Sha256Hasher,
 };
 use spaces_protocol::{
     bitcoin::{BlockHash, OutPoint},
     constants::{ChainAnchor, ROLLOUT_BATCH_SIZE},
     hasher::{BidKey, KeyHash, OutpointKey, SpaceKey},
-    prepare::DataSource,
+    prepare::SpacesSource,
     Covenant, FullSpaceOut, SpaceOut,
 };
 
 use crate::rpc::RootAnchor;
+use crate::store::{EncodableOutpoint, ReadTx, Sha256, SpaceDb, WriteMemory, WriteTx};
+
+#[derive(Clone)]
+pub struct SpStore(SpaceDb);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RolloutEntry {
@@ -36,24 +40,14 @@ pub struct RolloutEntry {
     pub value: u32,
 }
 
-type SpaceDb = Database<Sha256Hasher>;
-type ReadTx = ReadTransaction<Sha256Hasher>;
-pub type WriteTx<'db> = WriteTransaction<'db, Sha256Hasher>;
-type WriteMemory = BTreeMap<Hash, Option<Vec<u8>>>;
-
 #[derive(Clone)]
-pub struct Store(SpaceDb);
-
-pub struct Sha256;
-
-#[derive(Clone)]
-pub struct LiveStore {
-    pub store: Store,
-    pub state: LiveSnapshot,
+pub struct SpLiveStore {
+    pub store: SpStore,
+    pub state: SpLiveSnapshot,
 }
 
 #[derive(Clone)]
-pub struct LiveSnapshot {
+pub struct SpLiveSnapshot {
     db: SpaceDb,
     pub tip: Arc<RwLock<ChainAnchor>>,
     staged: Arc<RwLock<Staged>>,
@@ -67,7 +61,7 @@ pub struct Staged {
     memory: WriteMemory,
 }
 
-impl Store {
+impl SpStore {
     pub fn open(path: PathBuf) -> Result<Self> {
         let db = Self::open_db(path)?;
         Ok(Self(db))
@@ -129,7 +123,7 @@ impl Store {
         Ok(anchors)
     }
 
-    pub fn begin(&self, genesis_block: &ChainAnchor) -> Result<LiveSnapshot> {
+    pub fn begin(&self, genesis_block: &ChainAnchor) -> Result<SpLiveSnapshot> {
         let snapshot = self.0.begin_read()?;
         let anchor: ChainAnchor = if snapshot.metadata().len() == 0 {
             genesis_block.clone()
@@ -138,7 +132,7 @@ impl Store {
         };
 
         let version = anchor.hash;
-        let live = LiveSnapshot {
+        let live = SpLiveSnapshot {
             db: self.0.clone(),
             tip: Arc::new(RwLock::new(anchor)),
             staged: Arc::new(RwLock::new(Staged {
@@ -152,11 +146,11 @@ impl Store {
     }
 }
 
-pub trait ChainStore {
+pub trait SpStoreUtils {
     fn rollout_iter(&self) -> Result<(RolloutIterator, ReadTx)>;
 }
 
-impl ChainStore for Store {
+impl SpStoreUtils for SpStore {
     fn rollout_iter(&self) -> Result<(RolloutIterator, ReadTx)> {
         let snapshot = self.0.begin_read()?;
         Ok((
@@ -169,22 +163,7 @@ impl ChainStore for Store {
     }
 }
 
-#[derive(Encode, Decode)]
-pub struct EncodableOutpoint(#[bincode(with_serde)] pub OutPoint);
-
-impl From<OutPoint> for EncodableOutpoint {
-    fn from(value: OutPoint) -> Self {
-        Self(value)
-    }
-}
-
-impl From<EncodableOutpoint> for OutPoint {
-    fn from(value: EncodableOutpoint) -> Self {
-        value.0
-    }
-}
-
-pub trait ChainState {
+pub trait SpacesState {
     fn insert_spaceout(&self, key: OutpointKey, spaceout: SpaceOut);
     fn insert_space(&self, key: SpaceKey, outpoint: EncodableOutpoint);
 
@@ -196,7 +175,7 @@ pub trait ChainState {
     ) -> anyhow::Result<Option<FullSpaceOut>>;
 }
 
-impl ChainState for LiveSnapshot {
+impl SpacesState for SpLiveSnapshot {
     fn insert_spaceout(&self, key: OutpointKey, spaceout: SpaceOut) {
         self.insert(key, spaceout)
     }
@@ -227,7 +206,7 @@ impl ChainState for LiveSnapshot {
     }
 }
 
-impl LiveSnapshot {
+impl SpLiveSnapshot {
     #[inline]
     pub fn is_dirty(&self) -> bool {
         self.staged.read().expect("read").memory.len() > 0
@@ -482,7 +461,7 @@ impl LiveSnapshot {
     }
 }
 
-impl DataSource for LiveSnapshot {
+impl SpacesSource for SpLiveSnapshot {
     fn get_space_outpoint(
         &mut self,
         space_hash: &SpaceKey,
@@ -505,11 +484,7 @@ impl DataSource for LiveSnapshot {
     }
 }
 
-impl spaces_protocol::hasher::KeyHasher for Sha256 {
-    fn hash(data: &[u8]) -> spaces_protocol::hasher::Hash {
-        Sha256Hasher::hash(data)
-    }
-}
+
 
 pub struct RolloutIterator {
     inner: KeyIterator<Sha256Hasher>,

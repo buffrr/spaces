@@ -7,7 +7,7 @@ use crate::config::Args;
 use crate::rpc::{AsyncChainState, RpcServerImpl, WalletLoadRequest, WalletManager};
 use crate::source::{BitcoinBlockSource, BitcoinRpc};
 use crate::spaces::Spaced;
-use crate::store::LiveSnapshot;
+use crate::store::chain::{Chain};
 use crate::wallets::RpcWallet;
 
 pub struct App {
@@ -27,7 +27,7 @@ impl App {
         let wallet_service = RpcWallet::service(
             spaced.network,
             spaced.rpc.clone(),
-            spaced.chain.state.clone(),
+            spaced.chain.clone(),
             rx,
             self.shutdown.clone(),
             spaced.num_workers,
@@ -52,11 +52,11 @@ impl App {
             wallets: Arc::new(Default::default()),
         };
 
+        let chain_state = spaced.chain.clone();
         let (async_chain_state, async_chain_state_handle) = create_async_store(
             spaced.rpc.clone(),
             spaced.anchors_path.clone(),
-            spaced.chain.state.clone(),
-            spaced.block_index.as_ref().map(|index| index.state.clone()),
+            chain_state,
             self.shutdown.subscribe(),
         )
             .await;
@@ -116,8 +116,7 @@ impl App {
 async fn create_async_store(
     rpc: BitcoinRpc,
     anchors: Option<PathBuf>,
-    chain_state: LiveSnapshot,
-    block_index: Option<LiveSnapshot>,
+    state: Chain,
     shutdown: broadcast::Receiver<()>,
 ) -> (AsyncChainState, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(32);
@@ -128,8 +127,7 @@ async fn create_async_store(
             &client,
             rpc,
             anchors,
-            chain_state,
-            block_index,
+            state,
             rx,
             shutdown,
         )

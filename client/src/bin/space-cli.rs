@@ -5,7 +5,7 @@ use std::{
     io::{Cursor, IsTerminal, Write},
     path::PathBuf,
 };
-
+use std::str::FromStr;
 use anyhow::anyhow;
 use base64::Engine;
 use clap::{Parser, Subcommand};
@@ -35,13 +35,15 @@ use spaces_client::{
     serialize_base64,
     wallets::{AddressKind, WalletResponse},
 };
+use spaces_client::rpc::{CommitParams, CreatePtrParams, TransferPtrParams};
+use spaces_client::store::Sha256;
 use spaces_protocol::bitcoin::{Amount, FeeRate, OutPoint, Txid};
-use spaces_wallet::{
-    bitcoin::secp256k1::schnorr::Signature,
-    export::WalletExport,
-    nostr::{NostrEvent, NostrTag},
-    Listing,
-};
+use spaces_protocol::slabel::SLabel;
+use spaces_ptr::sptr::Sptr;
+use spaces_wallet::{bitcoin::secp256k1::schnorr::Signature, export::WalletExport, nostr::{NostrEvent, NostrTag}, Listing};
+use spaces_wallet::address::SpaceAddress;
+use spaces_wallet::bitcoin::hashes::sha256;
+use spaces_wallet::bitcoin::ScriptBuf;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -150,6 +152,19 @@ enum Commands {
         /// The space name
         space: String,
     },
+    /// Create a new ptr
+    #[command(name = "createptr")]
+    CreatePtr {
+        /// The script public key as hex string
+        spk: String,
+        fee_rate: Option<u64>,
+    },
+    /// Get ptr info
+    #[command(name = "getptr")]
+    GetPtr {
+        /// The sha256 hash of the spk or the spk itself prefixed with hex:
+        spk: String,
+    },
     /// Transfer ownership of a set of spaces to the given name or address
     #[command(
         name = "transfer",
@@ -166,6 +181,22 @@ enum Commands {
         #[arg(long, short)]
         fee_rate: Option<u64>,
     },
+    /// Transfer ownership of a set of ptrs to the given name or address
+    #[command(
+        name = "transferptr",
+        override_usage = "space-cli transferptr [PTRS]... --to <SPACE-OR-ADDRESS>"
+    )]
+    TransferPtr {
+        /// Ptrs to send
+        #[arg(display_order = 0)]
+        ptrs: Vec<String>,
+        /// Recipient space name or address (must be a space address)
+        #[arg(long, display_order = 1)]
+        to: String,
+        /// Fee rate to use in sat/vB
+        #[arg(long, short)]
+        fee_rate: Option<u64>,
+    },
     /// Renew ownership of a space
     #[command(name = "renew")]
     Renew {
@@ -175,6 +206,59 @@ enum Commands {
         /// Fee rate to use in sat/vB
         #[arg(long, short)]
         fee_rate: Option<u64>,
+    },
+    /// Initialize a space for operation of off-chain subspaces
+    #[command(name = "operate")]
+    Operate {
+        /// The space to apply new root
+        #[arg(display_order = 0)]
+        space: String,
+        /// Fee rate to use in sat/vB
+        #[arg(long, short)]
+        fee_rate: Option<u64>,
+    },
+    /// Commit a new root
+    #[command(name = "commit")]
+    Commit {
+        /// The space to apply new root
+        #[arg(display_order = 0)]
+        space: String,
+        /// The new state root
+        #[arg(long, display_order = 1)]
+        root: sha256::Hash,
+        /// Fee rate to use in sat/vB
+        #[arg(long, short)]
+        fee_rate: Option<u64>,
+    },
+    /// Delegate operation of a space to someone else
+    #[command(name = "delegate")]
+    Delegate {
+        /// Ptrs to send
+        #[arg(display_order = 0)]
+        space: String,
+        /// Recipient space name or address (must be a space address)
+        #[arg(long, display_order = 1)]
+        to: String,
+        /// Fee rate to use in sat/vB
+        #[arg(long, short)]
+        fee_rate: Option<u64>,
+    },
+    /// Get the current space a sptr is responsible for
+    #[command(name = "getdelegator")]
+    GetDelegator {
+        sptr: Sptr,
+    },
+    /// Get the current sptr responsible for a space
+    #[command(name = "getdelegation")]
+    GetDelegation {
+        space: SLabel,
+    },
+    /// Get a commitment for a space
+    #[command(name = "getcommitment")]
+    GetCommitment {
+        space: SLabel,
+        // If no specific root, the most recent commitment will be fetched
+        root: Option<sha256::Hash>,
     },
     /// Estimates the minimum bid needed for a rollout within the given target blocks
     #[command(name = "estimatebid")]
@@ -306,6 +390,12 @@ enum Commands {
     /// Get a spaceout - a Bitcoin output relevant to the Spaces protocol.
     #[command(name = "getspaceout")]
     GetSpaceOut {
+        /// The OutPoint
+        outpoint: OutPoint,
+    },
+    /// Get a ptrout
+    #[command(name = "getptrout")]
+    GetPtrOut {
         /// The OutPoint
         outpoint: OutPoint,
     },
@@ -966,6 +1056,172 @@ async fn handle_commands(cli: &SpaceCli, command: Commands) -> Result<(), Client
                 .map_err(|e| ClientError::Custom(e.to_string()))?;
 
             println!("{}", serde_json::to_string(&event).expect("result"));
+        }
+        Commands::CreatePtr { spk, fee_rate } => {
+            let spk = ScriptBuf::from(hex::decode(spk)
+                .map_err(|_| ClientError::Custom("Invalid spk hex".to_string()))?);
+
+            let sptr = Sptr::from_spk::<Sha256>(spk.clone());
+            println!("Creating sptr: {}", sptr);
+            cli.send_request(
+                Some(RpcWalletRequest::CreatePtr(CreatePtrParams {
+                    spk: hex::encode(spk.as_bytes()),
+                })),
+                None,
+                fee_rate,
+                false,
+            )
+                .await?
+        }
+        Commands::TransferPtr { ptrs, to, fee_rate } => {
+            let mut parsed = Vec::with_capacity(ptrs.len());
+            for ptr in ptrs {
+                parsed.push(Sptr::from_str(&ptr)
+                    .map_err(|e| ClientError::Custom(format!("invalid sptr:{}: {}", ptr, e.to_string())))?);
+            }
+
+            cli.send_request(
+                Some(RpcWalletRequest::TransferPtr(TransferPtrParams {
+                    ptrs: parsed,
+                    to,
+                })),
+                None,
+                fee_rate,
+                false,
+            )
+                .await?
+        }
+        Commands::GetPtr { spk } => {
+            let sptr = Sptr::from_str(&spk)
+                .map_err(|e| ClientError::Custom(format!("input error: {}", e.to_string())))?;
+
+            let ptr = cli
+                .client
+                .get_ptr(sptr)
+                .await
+                .map_err(|e| ClientError::Custom(e.to_string()))?;
+            println!("{}", serde_json::to_string(&ptr).expect("result"));
+        }
+
+        Commands::GetPtrOut { outpoint } => {
+            let ptrout = cli
+                .client
+                .get_ptrout(outpoint)
+                .await
+                .map_err(|e| ClientError::Custom(e.to_string()))?;
+            println!("{}", serde_json::to_string(&ptrout).expect("result"));
+        }
+        Commands::Operate { space, fee_rate } => {
+            let space_info = match cli.client.get_space(&space).await? {
+                Some(space_info) => space_info,
+                None => return Err(ClientError::Custom("no such space".to_string()))
+            };
+            let commitments_tip = cli.client.get_commitment(
+                space_info.spaceout.space.as_ref().expect("space").name.clone(),
+                                                            None
+            ).await?;
+            if commitments_tip.is_some() {
+                return Err(ClientError::Custom("space is already operational".to_string()));
+            }
+            
+            let address = cli.client.wallet_get_new_address(&cli.wallet, AddressKind::Space).await?;
+            let address = SpaceAddress::from_str(&address)
+                .expect("valid");
+            let spk = address.script_pubkey();
+            let sptr = Sptr::from_spk::<Sha256>(spk.clone());
+
+            println!("Assigning space to sptr {}", sptr);
+            cli.send_request(
+                Some(RpcWalletRequest::Transfer(TransferSpacesParams {
+                    spaces: vec![space],
+                    to: Some(address.to_string()),
+                })),
+                None,
+                fee_rate,
+                false,
+            )
+                .await?;
+            println!("Creating UTXO for sptr {}", sptr);
+            cli.send_request(
+                Some(RpcWalletRequest::CreatePtr(CreatePtrParams {
+                    spk: hex::encode(spk.as_bytes()),
+                })),
+                None,
+                fee_rate,
+                false,
+            )
+                .await?;
+            println!("Space should be operational once txs are confirmed");
+        }
+        Commands::Commit { space, root, fee_rate } => {
+            let space_info = match cli.client.get_space(&space).await? {
+                Some(space_info) => space_info,
+                None => return Err(ClientError::Custom("no such space".to_string()))
+            };
+
+            let label = space_info.spaceout.space.as_ref().expect("space").name.clone();
+            let delegation = cli.client.get_delegation(label.clone()).await?;
+            if delegation.is_none() {
+                return Err(ClientError::Custom("space is not operational - use operate @<your-space> first.".to_string()));
+            }
+            cli.send_request(
+                Some(RpcWalletRequest::Commit(CommitParams {
+                    space: label.clone(),
+                    root,
+                })),
+                None,
+                fee_rate,
+                false,
+            )
+                .await?;
+        }
+        Commands::Delegate { space, to, fee_rate } => {
+            let space_info = match cli.client.get_space(&space).await? {
+                Some(space_info) => space_info,
+                None => return Err(ClientError::Custom("no such space".to_string()))
+            };
+
+            let label = space_info.spaceout.space.as_ref().expect("space").name.clone();
+            let delegation = cli.client.get_delegation(label.clone()).await?;
+            if delegation.is_none() {
+                return Err(ClientError::Custom("space is not operational - use operate @<your-space> first.".to_string()));
+            }
+            let delegation = delegation.unwrap();
+
+            cli.send_request(
+                Some(RpcWalletRequest::TransferPtr(TransferPtrParams {
+                    ptrs: vec![delegation],
+                    to,
+                })),
+                None,
+                fee_rate,
+                false,
+            )
+                .await?;
+        }
+        Commands::GetDelegator { sptr } => {
+            let delegator = cli
+                .client
+                .get_delegator(sptr)
+                .await
+                .map_err(|e| ClientError::Custom(e.to_string()))?;
+            println!("{}", serde_json::to_string(&delegator).expect("result"));
+        }
+        Commands::GetDelegation { space } => {
+            let delegation = cli
+                .client
+                .get_delegation(space)
+                .await
+                .map_err(|e| ClientError::Custom(e.to_string()))?;
+            println!("{}", serde_json::to_string(&delegation).expect("result"));
+        }
+        Commands::GetCommitment { space, root } => {
+            let c = cli
+                .client
+                .get_commitment(space, root)
+                .await
+                .map_err(|e| ClientError::Custom(e.to_string()))?;
+            println!("{}", serde_json::to_string(& c).expect("result"));
         }
     }
 

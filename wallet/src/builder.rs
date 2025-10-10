@@ -27,7 +27,8 @@ use spaces_protocol::{
     script::SpaceScript,
     Covenant, FullSpaceOut, Space,
 };
-
+use spaces_protocol::hasher::Hash;
+use spaces_ptr::{FullPtrOut};
 use crate::{
     address::SpaceAddress, tx_event::TxRecord, DoubleUtxo, FullTxOut, SpaceScriptSigningInfo,
     SpacesWallet,
@@ -83,6 +84,9 @@ pub enum StackRequest {
     Transfer(SpaceTransfer),
     Send(CoinTransfer),
     Execute(ExecuteRequest),
+    Ptr(PtrRequest),
+    PtrTransfer(PtrTransfer),
+    Commitment(CommitmentRequest),
 }
 
 pub enum StackOp {
@@ -90,6 +94,7 @@ pub enum StackOp {
     Open(OpenRevealParams),
     Bid(BidRequest),
     Execute(ExecuteParams),
+    Ptr(PtrParams),
 }
 
 #[derive(Clone)]
@@ -117,8 +122,25 @@ pub struct RegisterRequest {
 }
 
 #[derive(Debug, Clone)]
+pub struct PtrRequest {
+    pub spk: ScriptBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommitmentRequest {
+    pub ptrout: FullPtrOut,
+    pub root: Hash,
+}
+
+#[derive(Debug, Clone)]
 pub struct SpaceTransfer {
     pub space: FullSpaceOut,
+    pub recipient: SpaceAddress,
+}
+
+#[derive(Debug, Clone)]
+pub struct PtrTransfer {
+    pub ptr: FullPtrOut,
     pub recipient: SpaceAddress,
 }
 
@@ -140,6 +162,12 @@ pub struct CreateParams {
     transfers: Vec<SpaceTransfer>,
     sends: Vec<CoinTransfer>,
     bidouts: Option<u8>,
+}
+
+pub struct PtrParams {
+    transfers: Vec<PtrTransfer>,
+    binds: Vec<PtrRequest>,
+    commitments: Vec<CommitmentRequest>,
 }
 
 #[derive(Clone, Debug)]
@@ -241,7 +269,7 @@ impl<'a, Cs: CoinSelectionAlgorithm> TxBuilderSpacesUtils<'a, Cs> for TxBuilder<
             placeholder.auction.outpoint.vout as u8,
             &offer,
         )?)
-        .expect("compressed psbt script bytes");
+            .expect("compressed psbt script bytes");
 
         let carrier = ScriptBuf::new_op_return(&compressed_psbt);
 
@@ -352,7 +380,7 @@ impl Builder {
                     Some(dust) => dust,
                 };
                 let connector_dust = connector_dust(dust);
-                let magic_dust = magic_dust(dust);
+                let magic_dust = space_utxo_dust(dust);
 
                 placeholder_outputs.push((addr1, connector_dust));
                 let addr2 = w.internal.next_unused_address(KeychainKind::External);
@@ -362,7 +390,7 @@ impl Builder {
 
         let commit_psbt = {
             let mut builder = w.build_tx(unspendables, confirmed_only)?;
-            builder.nlocktime(magic_lock_time(median_time));
+            builder.nlocktime(signal_space_utxo_tracking_lock_time(median_time));
 
             // handle transfers
             if !space_transfers.is_empty() {
@@ -394,7 +422,7 @@ impl Builder {
                         None => tap_item.tweaked_address.minimal_non_dust().mul(2),
                         Some(dust) => dust,
                     };
-                    let magic_dust = magic_dust(dust);
+                    let magic_dust = space_utxo_dust(dust);
 
                     builder.add_recipient(tap_item.tweaked_address.clone(), magic_dust);
                     tap_outputs.push(vout);
@@ -642,6 +670,21 @@ impl Iterator for BuilderIterator<'_> {
                     detailed
                 }))
             }
+            StackOp::Ptr(params) => {
+                let tx = Builder::ptr_tx(
+                    self.wallet,
+                    self.median_time,
+                    self.fee_rate,
+                    self.unspendables.clone(),
+                    self.confirmed_only, self.force,
+                    params,
+                );
+                Some(tx.map(|tx| {
+                    let detailed = TxRecord::new(tx);
+                    // TODO: add ptr metadata
+                    detailed
+                }))
+            }
         }
     }
 }
@@ -677,6 +720,12 @@ impl Builder {
         self
     }
 
+    pub fn add_commitment(mut self, req: CommitmentRequest) -> Self {
+        self.requests
+            .push(StackRequest::Commitment(req));
+        self
+    }
+
     pub fn add_open(mut self, name: &str, initial_amount: Amount) -> Self {
         self.requests.push(StackRequest::Open(OpenRequest {
             name: name.to_string(),
@@ -693,6 +742,16 @@ impl Builder {
 
     pub fn add_transfer(mut self, request: SpaceTransfer) -> Self {
         self.requests.push(StackRequest::Transfer(request));
+        self
+    }
+
+    pub fn add_ptr_transfer(mut self, request: PtrTransfer) -> Self {
+        self.requests.push(StackRequest::PtrTransfer(request));
+        self
+    }
+
+    pub fn add_ptr(mut self, request: PtrRequest) -> Self {
+        self.requests.push(StackRequest::Ptr(request));
         self
     }
 
@@ -781,6 +840,9 @@ impl Builder {
         let mut transfers = Vec::new();
         let mut sends = Vec::new();
         let mut executes = Vec::new();
+        let mut ptrs = Vec::new();
+        let mut ptr_transfers = Vec::new();
+        let mut commitments = Vec::new();
         for req in self.requests {
             match req {
                 StackRequest::Open(params) => opens.push(params),
@@ -798,6 +860,9 @@ impl Builder {
                 StackRequest::Send(send) => sends.push(send),
                 StackRequest::Transfer(params) => transfers.push(params),
                 StackRequest::Execute(params) => executes.push(params),
+                StackRequest::Ptr(params) => ptrs.push(params),
+                StackRequest::PtrTransfer(params) => ptr_transfers.push(params),
+                StackRequest::Commitment(req) => commitments.push(req),
             }
         }
 
@@ -821,6 +886,16 @@ impl Builder {
             }));
         }
 
+        if !ptrs.is_empty() || !ptr_transfers.is_empty() || !commitments.is_empty() {
+            let params = PtrParams {
+                transfers: ptr_transfers,
+                binds: ptrs,
+                commitments,
+            };
+            stack.push(StackOp::Ptr(params))
+        }
+
+
         Ok(BuilderIterator {
             stack,
             dust,
@@ -831,6 +906,85 @@ impl Builder {
             confirmed_only,
             median_time,
         })
+    }
+
+    fn ptr_tx(
+        w: &mut SpacesWallet,
+        median_time: u64,
+        fee_rate: FeeRate,
+        unspendables: Vec<OutPoint>,
+        confirmed_only: bool,
+        _force: bool,
+        params: PtrParams,
+    ) -> anyhow::Result<Transaction> {
+        let addr = w.next_unused_address(KeychainKind::Internal);
+        let mut builder = w.build_tx(unspendables, confirmed_only)?;
+        builder
+            .nlocktime(signal_ptr_tracking_lock_time(median_time))
+            .fee_rate(fee_rate);
+
+        // handle commitments
+        if !params.commitments.is_empty() {
+            if !params.transfers.is_empty() && params.binds.is_empty() {
+                return Err(anyhow!("combining commitments with binds and transfers is not yet supported"));
+            }
+            if params.commitments.len() != 1 {
+                return Err(anyhow!("multiple commitments are not yet supported"));
+            }
+            let commitment = params.commitments.first()
+                .expect("a commitment");
+
+            // First byte marker 0x77 || 32-byte root
+            let mut data = [0u8;33];
+            data[0] = 0x77;
+            data[1..].copy_from_slice(&commitment.root);
+            // Add first output OP_RETURN commitment
+            builder.add_data(&data);
+
+            let outpoint = OutPoint {
+                txid: commitment.ptrout.txid,
+                vout: commitment.ptrout.ptrout.n as _,
+            };
+            // spend ptr
+            builder.add_utxo(outpoint)
+                .map_err(|e| anyhow!("could not spend sptr at {}:{}", outpoint, e))?;
+            // add replacement at n+1
+            builder.add_recipient(commitment.ptrout.ptrout.script_pubkey.clone(), commitment.ptrout.ptrout.value);
+
+            let psbt = builder.finish()?;
+            let signed = w.sign(psbt, None)?;
+            return Ok(signed);
+        }
+
+        // ensure odd number of outputs to safely align transfers
+        if params.transfers.len() > 0 {
+            // TODO: avoid this once we have our own builder and can control change output
+            builder.add_recipient(addr.script_pubkey(), Amount::from_sat(2000));
+        }
+        for transfer in params.transfers {
+            let outpoint = OutPoint {
+                txid: transfer.ptr.txid,
+                vout: transfer.ptr.ptrout.n as _,
+            };
+
+            // spend ptr
+            builder.add_utxo(outpoint)
+                .map_err(|e| anyhow!("could not transfer ptr at {}:{}", outpoint, e))?;
+            // add replacement at n+1
+            builder.add_recipient(transfer.recipient.script_pubkey(), transfer.ptr.ptrout.value);
+        }
+
+        // Add any binds last to not mess with input/output order for transfers
+        for ptr in params.binds {
+            builder.add_recipient(
+                ptr.spk,
+                ptr_utxo_dust(Amount::from_sat(1000)),
+            );
+        }
+
+        let psbt = builder.finish()?;
+        let signed = w.sign(psbt, None)?;
+        Ok(signed)
     }
 
     fn bid_tx(
@@ -916,8 +1070,8 @@ impl Builder {
             let mut builder = w.build_tx(unspendables, confirmed_only)?;
 
             builder
-                // Added first to keep an odd number of outputs before adding transfers
-                .add_recipient(change_address, Amount::from_sat(1000));
+                // TODO: avoid this! added first to keep an odd number of outputs before adding transfers
+                .add_recipient(change_address, Amount::from_sat(2000));
 
             extra_prevouts.insert(
                 params.reveal.commitment.outpoint,
@@ -1016,9 +1170,9 @@ impl CoinSelectionAlgorithm for SpacesAwareCoinSelection {
 
             weighted_utxo.utxo.txout().value > SpacesAwareCoinSelection::DUST_THRESHOLD
                 && !self
-                    .exclude_outputs
-                    .iter()
-                    .any(|o| o == &weighted_utxo.utxo.outpoint())
+                .exclude_outputs
+                .iter()
+                .any(|o| o == &weighted_utxo.utxo.outpoint())
         });
 
         let mut result = self.default_algorithm.coin_select(
@@ -1049,13 +1203,25 @@ impl CoinSelectionAlgorithm for SpacesAwareCoinSelection {
     }
 }
 
-pub fn magic_lock_time(median_time: u64) -> LockTime {
+pub fn signal_ptr_tracking_lock_time(median_time: u64) -> LockTime {
+    let median_time = min(median_time, u32::MAX as u64) as u32;
+    let magic_time = median_time - (median_time % 1000) - (1000 - 777);
+    LockTime::from_time(magic_time).expect("valid time")
+}
+
+pub fn ptr_utxo_dust(amount: Amount) -> Amount {
+    let amount = amount.to_sat();
+    Amount::from_sat(amount - (amount % 10) + 7)
+}
+
+
+pub fn signal_space_utxo_tracking_lock_time(median_time: u64) -> LockTime {
     let median_time = min(median_time, u32::MAX as u64) as u32;
     let magic_time = median_time - (median_time % 1000) - (1000 - 222);
     LockTime::from_time(magic_time).expect("valid time")
 }
 
-pub fn magic_dust(amount: Amount) -> Amount {
+pub fn space_utxo_dust(amount: Amount) -> Amount {
     let amount = amount.to_sat();
     Amount::from_sat(amount - (amount % 10) + 2)
 }
