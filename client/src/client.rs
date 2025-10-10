@@ -286,6 +286,7 @@ impl Client {
                             },
                         });
                     }
+
                     self.apply_ptrs_tx(chain, tx, ptrs_validated);
                 }
             }

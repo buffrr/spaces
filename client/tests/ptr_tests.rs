@@ -16,24 +16,25 @@ use spaces_ptr::transcript_hash;
 use spaces_testutil::TestRig;
 use spaces_wallet::{export::WalletExport};
 use spaces_wallet::address::SpaceAddress;
-use spaces_wallet::bitcoin::{Network, ScriptBuf};
 
 const ALICE: &str = "wallet_99";
 const BOB: &str = "wallet_98";
 const EVE: &str = "wallet_93";
 
 async fn it_should_create_sptrs(rig: &TestRig) -> anyhow::Result<()> {
-
-    println!("sptr example: {}", Sptr::from_spk::<Sha256>(ScriptBuf::from(hex::decode("5120d3c3196cb3ed7fa79c882ed62f8e5942e546130d5ae5983da67dbb6c9bdd2e79").expect("valid"))));
-
     rig.wait_until_wallet_synced(ALICE).await?;
 
     // 1) Create ptr bound to addr0 (spk0)
     let addr0 = rig.spaced.client.wallet_get_new_address(ALICE, AddressKind::Coin).await?;
+    let addr0_spk = bitcoin::address::Address::from_str(&addr0)
+        .expect("valid").assume_checked()
+        .script_pubkey();
+    let addr0_spk_string = hex::encode(addr0_spk.as_bytes());
+
     let create0 = wallet_do(
         rig,
         ALICE,
-        vec![RpcWalletRequest::CreatePtr(CreatePtrParams { address: addr0.clone() })],
+        vec![RpcWalletRequest::CreatePtr(CreatePtrParams { spk: addr0_spk_string.clone() })],
         false,
     ).await.expect("CreatePtr addr0");
     assert!(wallet_res_err(&create0).is_ok(), "CreatePtr(addr0) must not error");
@@ -86,7 +87,7 @@ async fn it_should_create_sptrs(rig: &TestRig) -> anyhow::Result<()> {
     let dup = wallet_do(
         rig,
         ALICE,
-        vec![RpcWalletRequest::CreatePtr(CreatePtrParams { address: addr0.clone() })],
+        vec![RpcWalletRequest::CreatePtr(CreatePtrParams { spk: addr0_spk_string })],
         false,
     ).await.expect("duplicate CreatePtr(addr0)");
     assert!(wallet_res_err(&dup).is_ok(), "duplicate CreatePtr should not error");
@@ -171,15 +172,11 @@ async fn it_should_operate_space(rig: &TestRig) -> anyhow::Result<()> {
     assert_eq!(current_spk, spk_after, "space spk must remain the same after renewal");
 
     // --- Create/bind an SPTR using the SAME scriptPubKey as the space ---
-    let space_addr = bitcoin::address::Address::from_script(&current_spk, Network::Regtest)
-        .expect("derive address from space spk")
-        .to_string();
-
     let create_ptr_res = wallet_do(
         rig,
         ALICE,
         vec![RpcWalletRequest::CreatePtr(CreatePtrParams {
-            address: space_addr.clone(),
+            spk: hex::encode(current_spk.as_bytes()),
         })],
         false,
     )

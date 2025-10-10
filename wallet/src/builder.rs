@@ -21,7 +21,6 @@ use bitcoin::{
     Amount, FeeRate, Network, OutPoint, Psbt, Script, ScriptBuf, Sequence, Transaction, TxOut,
     Txid, Weight, Witness,
 };
-use bitcoin::address::NetworkUnchecked;
 use spaces_protocol::{
     bitcoin::absolute::Height,
     constants::{BID_PSBT_INPUT_SEQUENCE, BID_PSBT_TX_VERSION},
@@ -124,7 +123,7 @@ pub struct RegisterRequest {
 
 #[derive(Debug, Clone)]
 pub struct PtrRequest {
-    pub ptr: Address<NetworkUnchecked>,
+    pub spk: ScriptBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -978,7 +977,7 @@ impl Builder {
         // Add any binds last to not mess with input/output order for transfers
         for ptr in params.binds {
             builder.add_recipient(
-                ptr.ptr.assume_checked().script_pubkey(),
+                ptr.spk,
                 ptr_utxo_dust(Amount::from_sat(1000)),
             );
         }

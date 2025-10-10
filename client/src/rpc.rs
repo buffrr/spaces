@@ -448,7 +448,7 @@ pub struct TransferPtrParams {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CreatePtrParams {
-    pub address: String,
+    pub spk: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

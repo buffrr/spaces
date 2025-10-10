@@ -36,7 +36,7 @@ use tokio::{
     time::Instant,
 };
 use spaces_protocol::bitcoin::address::ParseError;
-use spaces_protocol::bitcoin::Network;
+use spaces_protocol::bitcoin::{Network, ScriptBuf};
 use spaces_ptr::sptr::{Sptr, SptrParseError, SPTR_HRP};
 use spaces_wallet::builder::{CommitmentRequest, PtrRequest, PtrTransfer};
 use crate::{calc_progress, checker::TxChecker, client::BlockSource, config::ExtendedNetwork, rpc::{RpcWalletRequest, RpcWalletTxBuilder, WalletLoadRequest}, source::{
@@ -1275,10 +1275,12 @@ impl RpcWallet {
                     }
                 }
                 RpcWalletRequest::CreatePtr(params) => {
-                    let addr = Address::from_str(&params.address)
-                        .map_err(|e| anyhow!("transferptr: invalid address for ptr {}: {:?}", params.address, e))?;
+                    let spk_raw = hex::decode(params.spk)
+                        .map_err(|e| anyhow!("transferptr: invalid spk: {:?}", e))?;
+
+                    let spk = ScriptBuf::from(spk_raw);
                     builder = builder.add_ptr(PtrRequest {
-                        ptr: addr,
+                        spk,
                     })
                 }
                 RpcWalletRequest::Commit(params) => {

@@ -38,10 +38,9 @@ use spaces_client::{
 use spaces_client::rpc::{CommitParams, CreatePtrParams, TransferPtrParams};
 use spaces_client::store::Sha256;
 use spaces_protocol::bitcoin::{Amount, FeeRate, OutPoint, Txid};
-use spaces_protocol::bitcoin::params::Params;
 use spaces_protocol::slabel::SLabel;
 use spaces_ptr::sptr::Sptr;
-use spaces_wallet::{bitcoin, bitcoin::secp256k1::schnorr::Signature, export::WalletExport, nostr::{NostrEvent, NostrTag}, Listing};
+use spaces_wallet::{bitcoin::secp256k1::schnorr::Signature, export::WalletExport, nostr::{NostrEvent, NostrTag}, Listing};
 use spaces_wallet::address::SpaceAddress;
 use spaces_wallet::bitcoin::hashes::sha256;
 use spaces_wallet::bitcoin::ScriptBuf;
@@ -1062,15 +1061,11 @@ async fn handle_commands(cli: &SpaceCli, command: Commands) -> Result<(), Client
             let spk = ScriptBuf::from(hex::decode(spk)
                 .map_err(|_| ClientError::Custom("Invalid spk hex".to_string()))?);
 
-            let addr = bitcoin::address::Address::from_script(spk.as_script(),
-                                                              Params::new(cli.network.fallback_network()))
-                .map_err(|_| ClientError::Custom("Invalid spk".to_string()))?;
-
-            let sptr = Sptr::from_spk::<Sha256>(spk);
+            let sptr = Sptr::from_spk::<Sha256>(spk.clone());
             println!("Creating sptr: {}", sptr);
             cli.send_request(
                 Some(RpcWalletRequest::CreatePtr(CreatePtrParams {
-                    address: addr.to_string(),
+                    spk: hex::encode(spk.as_bytes()),
                 })),
                 None,
                 fee_rate,
@@ -1129,26 +1124,27 @@ async fn handle_commands(cli: &SpaceCli, command: Commands) -> Result<(), Client
                 return Err(ClientError::Custom("space is already operational".to_string()));
             }
             
-            let sptr_addr = cli.client.wallet_get_new_address(&cli.wallet, AddressKind::Space).await?;
-            let sptr = Sptr::from_spk::<Sha256>(SpaceAddress::from_str(&sptr_addr)
-                .expect("valid").script_pubkey());
+            let address = cli.client.wallet_get_new_address(&cli.wallet, AddressKind::Space).await?;
+            let address = SpaceAddress::from_str(&address)
+                .expect("valid");
+            let spk = address.script_pubkey();
+            let sptr = Sptr::from_spk::<Sha256>(spk.clone());
 
             println!("Assigning space to sptr {}", sptr);
             cli.send_request(
                 Some(RpcWalletRequest::Transfer(TransferSpacesParams {
                     spaces: vec![space],
-                    to: Some(sptr_addr.clone()),
+                    to: Some(address.to_string()),
                 })),
                 None,
                 fee_rate,
                 false,
             )
                 .await?;
-            let addr = SpaceAddress::from_str(&sptr_addr).expect("valid");
             println!("Creating UTXO for sptr {}", sptr);
             cli.send_request(
                 Some(RpcWalletRequest::CreatePtr(CreatePtrParams {
-                    address: addr.0.to_string(),
+                    spk: hex::encode(spk.as_bytes()),
                 })),
                 None,
                 fee_rate,
