@@ -1,7 +1,7 @@
 use bitcoin::Network;
 
 pub const PTR_MAINNET_HEIGHT : u32 = 922_777;
-pub const PTR_TESTNET4_HEIGHT : u32 = 100_000;
+pub const PTR_TESTNET4_HEIGHT : u32 = 100_008;
 pub const PTR_REGTEST_HEIGHT : u32 = 0;
 
 pub fn ptrs_start_height(network: &Network) -> u32 {

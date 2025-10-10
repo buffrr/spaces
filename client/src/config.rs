@@ -195,10 +195,12 @@ impl Args {
         );
 
         let genesis = Spaced::genesis(args.chain);
+        let ptr_genesis = Spaced::ptr_genesis(args.chain);
 
         let chain = Chain::load(
             args.chain.fallback_network(),
             genesis,
+            ptr_genesis,
             &data_dir,
             args.block_index || args.block_index_full,
             args.block_index || args.block_index_full, // TODO: option to index ptrs

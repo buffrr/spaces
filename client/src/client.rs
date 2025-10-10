@@ -161,7 +161,7 @@ impl Client {
             }
         }
         // Ptrs tip must connect to block
-        {
+        if chain.can_scan_ptrs(height) {
             let tip = chain.ptrs_tip();
             if tip.hash != block.header.prev_blockhash || tip.height + 1 != height {
                 return Err(SyncError {
@@ -254,8 +254,14 @@ impl Client {
                 self.apply_space_tx(chain, &tx, validated_tx);
             }
 
-            let ptrs_ctx =
-                { spaces_ptr::TxContext::from_tx::<Chain, Sha256>(chain, tx, spaceouts.is_some() || spaceouts_input_ctx.is_some())? };
+            let ptrs_ctx = if chain.can_scan_ptrs(height) {
+                spaces_ptr::TxContext::from_tx::<Chain, Sha256>(
+                    chain,
+                    tx,
+                    spaceouts.is_some() || spaceouts_input_ctx.is_some())?
+            } else {
+                None
+            };
 
             if let Some(ptrs_ctx) = ptrs_ctx {
                 let spent_spaceouts = spaceouts_input_ctx.unwrap_or_default().into_iter()
@@ -286,7 +292,9 @@ impl Client {
         }
 
         chain.update_spaces_tip(height, block_hash);
-        chain.update_ptrs_tip(height, block_hash);
+        if chain.can_scan_ptrs(height) {
+            chain.update_ptrs_tip(height, block_hash);
+        }
 
         Ok((spaces_meta, ptr_meta))
     }

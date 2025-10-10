@@ -39,6 +39,7 @@ const_assert!(
 pub struct Chain {
     db: LiveStore,
     idx: LiveIndex,
+    ptrs_genesis: ChainAnchor,
 }
 
 #[derive(Clone)]
@@ -94,8 +95,7 @@ impl Chain {
         self.db.pt.state.get_ptr_info(key)
     }
 
-    pub fn load(network: Network, genesis: ChainAnchor, dir: &Path, index_spaces: bool, index_ptrs: bool) -> anyhow::Result<Self> {
-        let ptrs_genesis = spaces_ptr::constants::ptrs_start_height(&network);
+    pub fn load(_network: Network, genesis: ChainAnchor, ptrs_genesis: ChainAnchor, dir: &Path, index_spaces: bool, index_ptrs: bool) -> anyhow::Result<Self> {
         let proto_db_path = dir.join("protocol.sdb");
         let ptrs_db_path = dir.join("ptrs.sdb");
         let initial_sp_sync = !proto_db_path.exists();
@@ -109,7 +109,7 @@ impl Chain {
 
         let pt_store = PtrStore::open(ptrs_db_path)?;
         let pt = PtrLiveStore {
-            state: pt_store.begin(&genesis)?,
+            state: pt_store.begin(&ptrs_genesis)?,
             store: pt_store,
         };
 
@@ -130,27 +130,23 @@ impl Chain {
         let chain = Chain {
             db: LiveStore { sp, pt },
             idx: LiveIndex { sp: sp_idx, pt: pt_idx },
+            ptrs_genesis
         };
 
         // If spaces synced past the ptrs point, reset the tip
         if initial_pt_sync {
             let sp_tip = chain.db.sp.state.tip.read().expect("tip").clone();
-            if sp_tip.height > ptrs_genesis {
+            if sp_tip.height > ptrs_genesis.height {
                 info!("spaces tip = {} > ptrs genesis = {} - rescanning to index ptrs",
-                    sp_tip.height, ptrs_genesis
+                    sp_tip.height, ptrs_genesis.height
                 );
                 assert_eq!(
-                    ptrs_genesis % COMMIT_BLOCK_INTERVAL, 0,
+                    ptrs_genesis.height % COMMIT_BLOCK_INTERVAL, 0,
                     "ptrs genesis must align with commit interval"
                 );
-                chain.restore_spaces(|height| {
-                    if height != ptrs_genesis {
-                        // return a dummy hash until we have a checkpoint matching ptrs genesis
-                        return Ok(BlockHash::from_slice(&[0u8; 32]).expect("hash"));
-                    }
-
-                    Ok(sp_tip.hash)
-                })?;
+                chain.restore_spaces(|_| {
+                    return Ok(BlockHash::from_slice(&[0u8; 32]).expect("hash"));
+                }, Some(ptrs_genesis.height))?;
             }
         }
 
@@ -263,6 +259,10 @@ impl Chain {
         *self.db.pt.state.tip.read().expect("ptrs tip")
     }
 
+    pub fn can_scan_ptrs(&self, height: u32) -> bool {
+        height > self.ptrs_genesis.height
+    }
+
     pub fn update_ptrs_tip(&self, height: u32, block_hash: BlockHash) {
         let mut tip = self.db.pt.state.tip.write().expect("write tip");
         tip.height = height;
@@ -349,7 +349,7 @@ impl Chain {
     where
         F: Fn(u32) -> anyhow::Result<BlockHash>,
     {
-        let point = self.restore_spaces(get_block_hash)?;
+        let point = self.restore_spaces(get_block_hash, None)?;
         self.restore_ptrs(point)
     }
 
@@ -405,7 +405,7 @@ impl Chain {
         Ok(())
     }
 
-    pub fn restore_spaces<F>(&self, get_block_hash: F) -> anyhow::Result<ChainAnchor>
+    pub fn restore_spaces<F>(&self, get_block_hash: F, restore_to_height: Option<u32>) -> anyhow::Result<ChainAnchor>
     where
         F: Fn(u32) -> anyhow::Result<BlockHash>,
     {
@@ -413,14 +413,19 @@ impl Chain {
         for (snapshot_index, snapshot) in chain_iter.enumerate() {
             let chain_snapshot = snapshot?;
             let chain_checkpoint: ChainAnchor = chain_snapshot.metadata().try_into()?;
-            let required_hash = get_block_hash(chain_checkpoint.height)?;
-
-            if required_hash != chain_checkpoint.hash {
-                info!(
-                    "Could not restore to block={} height={}",
-                    chain_checkpoint.hash, chain_checkpoint.height
-                );
-                continue;
+            if let Some(restore_to_height) = restore_to_height {
+                if restore_to_height != chain_checkpoint.height {
+                    continue;
+                }
+            } else {
+                let required_hash = get_block_hash(chain_checkpoint.height)?;
+                if required_hash != chain_checkpoint.hash {
+                    info!(
+                        "Could not restore to block={} height={}",
+                        chain_checkpoint.hash, chain_checkpoint.height
+                    );
+                    continue;
+                }
             }
 
             info!(
