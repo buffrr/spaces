@@ -110,9 +110,10 @@ impl SpStore {
             if let Some(existing) = prev_map.get(&(anchor.hash, anchor.height)) {
                 anchors.push(existing.clone());
             } else {
-                let root = snap.compute_root()?;
+                let spaces_root = snap.compute_root()?;
                 anchors.push(RootAnchor {
-                    root,
+                    spaces_root,
+                    ptrs_root: None,
                     block: anchor,
                 });
             }

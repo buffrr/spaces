@@ -69,6 +69,32 @@ impl<'de> serde::Deserialize<'de> for Sptr {
     }
 }
 
+#[cfg(feature = "bincode")]
+mod bincode_impl {
+    use bincode::{
+        de::{Decoder},
+        enc::Encoder,
+        error::{DecodeError, EncodeError},
+        impl_borrow_decode, Decode, Encode,
+    };
+    use super::*;
+
+    impl Encode for Sptr {
+        fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
+            Encode::encode(&self.0, encoder)
+        }
+    }
+
+    impl<Context> Decode<Context> for Sptr {
+        fn decode<D: Decoder<Context = Context>>(decoder: &mut D) -> Result<Self, DecodeError> {
+            let bytes: [u8; 32] = Decode::decode(decoder)?;
+            Ok(Sptr(bytes))
+        }
+    }
+
+    impl_borrow_decode!(Sptr);
+}
+
 impl From<bech32::DecodeError> for SptrParseError {
     fn from(e: bech32::DecodeError) -> Self { SptrParseError::Bech32(e) }
 }

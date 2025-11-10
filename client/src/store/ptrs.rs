@@ -124,8 +124,8 @@ pub trait PtrChainState {
 }
 
 impl PtrChainState for PtrLiveSnapshot {
-    fn insert_ptrout(&self, key: OutpointKey, spaceout: PtrOut) {
-        self.insert(key, spaceout)
+    fn insert_ptrout(&self, key: OutpointKey, ptrout: PtrOut) {
+        self.insert(key, ptrout)
     }
 
     fn insert_commitment(&self, key: CommitmentKey, commitment: Commitment) {

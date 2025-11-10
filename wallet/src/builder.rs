@@ -5,7 +5,6 @@ use std::{
     ops::{Add, Mul},
     str::FromStr,
 };
-
 use anyhow::{anyhow, Context};
 use bdk_wallet::{
     coin_selection::{
@@ -28,7 +27,7 @@ use spaces_protocol::{
     Covenant, FullSpaceOut, Space,
 };
 use spaces_protocol::hasher::Hash;
-use spaces_ptr::{FullPtrOut};
+use spaces_ptr::{create_commitment_script, CommitmentOp, FullPtrOut};
 use crate::{
     address::SpaceAddress, tx_event::TxRecord, DoubleUtxo, FullTxOut, SpaceScriptSigningInfo,
     SpacesWallet,
@@ -129,13 +128,14 @@ pub struct PtrRequest {
 #[derive(Debug, Clone)]
 pub struct CommitmentRequest {
     pub ptrout: FullPtrOut,
-    pub root: Hash,
+    pub root: Option<Hash>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SpaceTransfer {
     pub space: FullSpaceOut,
     pub recipient: SpaceAddress,
+    pub create_ptr: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -392,7 +392,8 @@ impl Builder {
             let mut builder = w.build_tx(unspendables, confirmed_only)?;
             builder.nlocktime(signal_space_utxo_tracking_lock_time(median_time));
 
-            // handle transfers
+            // handle transfers and collect PTR addresses
+            let mut ptr_addresses = Vec::new();
             if !space_transfers.is_empty() {
                 // Must be an odd number of outputs so that
                 // transfers align correctly
@@ -402,10 +403,13 @@ impl Builder {
                         None => change_address.minimal_non_dust().mul(2),
                         Some(dust) => dust,
                     };
-                    builder.add_recipient(change_address, dust);
+                    builder.add_recipient(change_address.clone(), dust);
                     vout += 1;
                 }
                 for transfer in space_transfers {
+                    if transfer.create_ptr {
+                        ptr_addresses.push(transfer.recipient.script_pubkey());
+                    }
                     builder.add_transfer(transfer)?;
                     vout += 1;
                 }
@@ -433,6 +437,23 @@ impl Builder {
             if !coin_transfers.is_empty() {
                 for coin in coin_transfers {
                     builder.add_send(coin)?;
+                    vout += 1;
+                }
+            }
+
+            // Add PTR outputs for delegations
+            if !ptr_addresses.is_empty() {
+                // Add dummy output to absorb conflicts from PTR inputs using n+1 rule
+                // This is a temporary workaround until we have better change output control
+                let dummy_dust = Amount::from_sat(546);
+                builder.add_recipient(change_address.clone(), dummy_dust);
+                vout += 1;
+
+                for spk in ptr_addresses {
+                    builder.add_recipient(
+                        spk,
+                        ptr_utxo_dust(Amount::from_sat(1000)),
+                    );
                     vout += 1;
                 }
             }
@@ -855,6 +876,7 @@ impl Builder {
                     transfers.push(SpaceTransfer {
                         space: params.space,
                         recipient: to,
+                        create_ptr: false,
                     })
                 }
                 StackRequest::Send(send) => sends.push(send),
@@ -895,7 +917,6 @@ impl Builder {
             stack.push(StackOp::Ptr(params))
         }
 
-
         Ok(BuilderIterator {
             stack,
             dust,
@@ -917,50 +938,50 @@ impl Builder {
         _force: bool,
         params: PtrParams,
     ) -> anyhow::Result<Transaction> {
-        let addr = w.next_unused_address(KeychainKind::Internal);
         let mut builder = w.build_tx(unspendables, confirmed_only)?;
         builder
             .nlocktime(signal_ptr_tracking_lock_time(median_time))
             .fee_rate(fee_rate);
 
-        // handle commitments
+        // Handle commitments:
         if !params.commitments.is_empty() {
-            if !params.transfers.is_empty() && params.binds.is_empty() {
+            if !params.transfers.is_empty() || !params.binds.is_empty() {
                 return Err(anyhow!("combining commitments with binds and transfers is not yet supported"));
             }
-            if params.commitments.len() != 1 {
-                return Err(anyhow!("multiple commitments are not yet supported"));
-            }
-            let commitment = params.commitments.first()
-                .expect("a commitment");
 
-            // First byte marker 0x77 || 32-byte root
-            let mut data = [0u8;33];
-            data[0] = 0x77;
-            data[1..].copy_from_slice(&commitment.root);
-            // Add first output OP_RETURN commitment
-            builder.add_data(&data);
-
-            let outpoint = OutPoint {
-                txid: commitment.ptrout.txid,
-                vout: commitment.ptrout.ptrout.n as _,
+            let script = if params.commitments.iter().all(|c| c.root.is_none()) {
+                // rollback
+                create_commitment_script(&CommitmentOp::Rollback)
+            } else if params.commitments.iter().all(|c| c.root.is_some()) {
+                let roots = params.commitments.iter()
+                    .map(|c| c.root.unwrap()).collect::<Vec<_>>();
+                create_commitment_script(&CommitmentOp::Commit(roots))
+            } else {
+                return Err(anyhow!("cannot combine rollbacks and new commitments in the same tx"));
             };
-            // spend ptr
-            builder.add_utxo(outpoint)
-                .map_err(|e| anyhow!("could not spend sptr at {}:{}", outpoint, e))?;
-            // add replacement at n+1
-            builder.add_recipient(commitment.ptrout.ptrout.script_pubkey.clone(), commitment.ptrout.ptrout.value);
+
+            // Transfer ptrs we're committing
+            for c in params.commitments {
+                let outpoint = OutPoint {
+                    txid: c.ptrout.txid,
+                    vout: c.ptrout.ptrout.n as _,
+                };
+                // spend ptr
+                builder.add_utxo(outpoint)
+                    .map_err(|e| anyhow!("could not spend sptr at {}:{}", outpoint, e))?;
+                // add replacement at the same index
+                builder.add_recipient(c.ptrout.ptrout.script_pubkey.clone(), c.ptrout.ptrout.value);
+            }
+
+            // Add OP_RETURN commitment last
+            builder.add_recipient(script, Amount::from_sat(0));
 
             let psbt = builder.finish()?;
             let signed = w.sign(psbt, None)?;
             return Ok(signed);
         }
 
-        // ensure odd number of outputs to safely align transfers
-        if params.transfers.len() > 0 {
-            // TODO: avoid this once we have our own builder and can control change output
-            builder.add_recipient(addr.script_pubkey(), Amount::from_sat(2000));
-        }
+        // Handle transfers:
         for transfer in params.transfers {
             let outpoint = OutPoint {
                 txid: transfer.ptr.txid,
@@ -970,11 +991,11 @@ impl Builder {
             // spend ptr
             builder.add_utxo(outpoint)
                 .map_err(|e| anyhow!("could not transfer ptr at {}:{}", outpoint, e))?;
-            // add replacement at n+1
+            // add replacement output at the same index
             builder.add_recipient(transfer.recipient.script_pubkey(), transfer.ptr.ptrout.value);
         }
 
-        // Add any binds last to not mess with input/output order for transfers
+        // Handle binds: add any binds last to not mess with input/output order for transfers
         for ptr in params.binds {
             builder.add_recipient(
                 ptr.spk,

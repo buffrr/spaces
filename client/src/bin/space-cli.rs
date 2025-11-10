@@ -157,6 +157,8 @@ enum Commands {
     CreatePtr {
         /// The script public key as hex string
         spk: String,
+
+        #[arg(long, short)]
         fee_rate: Option<u64>,
     },
     /// Get ptr info
@@ -211,7 +213,6 @@ enum Commands {
     #[command(name = "operate")]
     Operate {
         /// The space to apply new root
-        #[arg(display_order = 0)]
         space: String,
         /// Fee rate to use in sat/vB
         #[arg(long, short)]
@@ -221,10 +222,8 @@ enum Commands {
     #[command(name = "commit")]
     Commit {
         /// The space to apply new root
-        #[arg(display_order = 0)]
         space: String,
         /// The new state root
-        #[arg(long, display_order = 1)]
         root: sha256::Hash,
         /// Fee rate to use in sat/vB
         #[arg(long, short)]
@@ -1167,7 +1166,7 @@ async fn handle_commands(cli: &SpaceCli, command: Commands) -> Result<(), Client
             cli.send_request(
                 Some(RpcWalletRequest::Commit(CommitParams {
                     space: label.clone(),
-                    root,
+                    root: Some(root),
                 })),
                 None,
                 fee_rate,

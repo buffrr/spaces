@@ -56,7 +56,7 @@ use crate::wallets::WalletInfoWithProgress;
 use crate::{
     calc_progress,
     checker::TxChecker,
-    client::{BlockMeta, TxEntry, BlockchainInfo},
+    client::{BlockMeta, PtrBlockMeta, TxEntry, BlockchainInfo},
     config::ExtendedNetwork,
     deserialize_base64, serialize_base64,
     source::BitcoinRpc,
@@ -93,7 +93,13 @@ pub struct RootAnchor {
         serialize_with = "serialize_hash",
         deserialize_with = "deserialize_hash"
     )]
-    pub root: spaces_protocol::hasher::Hash,
+    pub spaces_root: spaces_protocol::hasher::Hash,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_hash",
+        deserialize_with = "deserialize_optional_hash"
+    )]
+    pub ptrs_root: Option<spaces_protocol::hasher::Hash>,
     pub block: ChainAnchor,
 }
 
@@ -109,6 +115,13 @@ pub struct BlockMetaWithHash {
     pub hash: BlockHash,
     #[serde(flatten)]
     pub block_meta: BlockMeta,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtrBlockMetaWithHash {
+    pub hash: BlockHash,
+    #[serde(flatten)]
+    pub block_meta: PtrBlockMeta,
 }
 
 pub enum ChainStateCommand {
@@ -163,6 +176,10 @@ pub enum ChainStateCommand {
     GetBlockMeta {
         height_or_hash: HeightOrHash,
         resp: Responder<anyhow::Result<BlockMetaWithHash>>,
+    },
+    GetPtrBlockMeta {
+        height_or_hash: HeightOrHash,
+        resp: Responder<anyhow::Result<PtrBlockMetaWithHash>>,
     },
     EstimateBid {
         target: usize,
@@ -262,6 +279,12 @@ pub trait Rpc {
         &self,
         height_or_hash: HeightOrHash,
     ) -> Result<BlockMetaWithHash, ErrorObjectOwned>;
+
+    #[method(name = "getptrblockmeta")]
+    async fn get_ptr_block_meta(
+        &self,
+        height_or_hash: HeightOrHash,
+    ) -> Result<PtrBlockMetaWithHash, ErrorObjectOwned>;
 
     #[method(name = "gettxmeta")]
     async fn get_tx_meta(&self, txid: Txid) -> Result<Option<TxEntry>, ErrorObjectOwned>;
@@ -426,6 +449,8 @@ pub enum RpcWalletRequest {
     TransferPtr(TransferPtrParams),
     #[serde(rename = "createptr")]
     CreatePtr(CreatePtrParams),
+    #[serde(rename = "delegate")]
+    Delegate(DelegateParams),
     #[serde(rename = "commit")]
     Commit(CommitParams),
     #[serde(rename = "send")]
@@ -452,10 +477,16 @@ pub struct CreatePtrParams {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct DelegateParams {
+    pub space: SLabel,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CommitParams {
     pub space: SLabel,
-    pub root: sha256::Hash,
+    pub root: Option<sha256::Hash>,
 }
+
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SendCoinsParams {
@@ -537,6 +568,32 @@ where
         spaces_protocol::hasher::Hash::deserialize(deserializer)?;
     }
     Ok(bytes)
+}
+
+fn serialize_optional_hash<S>(
+    bytes: &Option<spaces_protocol::hasher::Hash>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match bytes {
+        Some(b) => serialize_hash(b, serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn deserialize_optional_hash<'de, D>(deserializer: D) -> Result<Option<spaces_protocol::hasher::Hash>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?
+        .map(|s| {
+            let mut bytes = [0u8; 32];
+            hex::decode_to_slice(s, &mut bytes).map_err(serde::de::Error::custom)?;
+            Ok(bytes)
+        })
+        .transpose()
 }
 
 #[derive(Clone)]
@@ -991,6 +1048,19 @@ impl RpcServer for RpcServerImpl {
         Ok(data)
     }
 
+    async fn get_ptr_block_meta(
+        &self,
+        height_or_hash: HeightOrHash,
+    ) -> Result<PtrBlockMetaWithHash, ErrorObjectOwned> {
+        let data = self
+            .store
+            .get_ptr_block_meta(height_or_hash)
+            .await
+            .map_err(|error| ErrorObjectOwned::owned(-1, error.to_string(), None::<String>))?;
+
+        Ok(data)
+    }
+
     async fn get_tx_meta(&self, txid: Txid) -> Result<Option<TxEntry>, ErrorObjectOwned> {
         let data = self
             .store
@@ -1337,6 +1407,52 @@ impl AsyncChainState {
         })
     }
 
+    async fn get_indexed_ptr_block(
+        state: &mut Chain,
+        height_or_hash: HeightOrHash,
+        client: &reqwest::Client,
+        rpc: &BitcoinRpc,
+    ) -> Result<PtrBlockMetaWithHash, anyhow::Error> {
+        let hash = match height_or_hash {
+            HeightOrHash::Hash(hash) => hash,
+            HeightOrHash::Height(height) => rpc
+                .send_json(client, &rpc.get_block_hash(height))
+                .await
+                .map_err(|e| anyhow!("Could not retrieve block hash ({})", e))?,
+        };
+
+        if let Some(block_meta) = state.get_ptrs_block(hash)? {
+            return Ok(block_meta);
+        }
+
+        let info: serde_json::Value = rpc
+            .send_json(client, &rpc.get_block_header(&hash))
+            .await
+            .map_err(|e| anyhow!("Could not retrieve block ({})", e))?;
+
+        let height = info
+            .get("height")
+            .and_then(|t| t.as_u64())
+            .and_then(|h| u32::try_from(h).ok())
+            .ok_or_else(|| anyhow!("Could not retrieve block height"))?;
+
+        let ptrs_tip = state.ptrs_tip();
+        if height > ptrs_tip.height {
+            return Err(anyhow!(
+                "Ptrs is syncing at height {}, requested block height {}",
+                ptrs_tip.height,
+                height
+            ));
+        }
+        Ok(PtrBlockMetaWithHash {
+            hash,
+            block_meta: PtrBlockMeta {
+                height,
+                tx_meta: Vec::new(),
+            },
+        })
+    }
+
     pub async fn handle_command(
         client: &reqwest::Client,
         rpc: &BitcoinRpc,
@@ -1419,6 +1535,15 @@ impl AsyncChainState {
                         .await;
                 let _ = resp.send(res);
             }
+            ChainStateCommand::GetPtrBlockMeta {
+                height_or_hash,
+                resp,
+            } => {
+                let res =
+                    Self::get_indexed_ptr_block(state, height_or_hash, client, rpc)
+                        .await;
+                let _ = resp.send(res);
+            }
             ChainStateCommand::GetTxMeta { txid, resp } => {
                 let res = Self::get_indexed_tx(state, &txid, client, rpc).await;
                 let _ = resp.send(res);
@@ -1483,10 +1608,21 @@ impl AsyncChainState {
         }
 
         let snapshot = state.spaces_inner()?;
-        let root = snapshot.compute_root()?;
+        let spaces_root = snapshot.compute_root()?;
         let meta: ChainAnchor = snapshot.metadata().try_into()?;
+
+        // Try to compute PTR root if we're past PTR genesis
+        let ptrs_root = if state.can_scan_ptrs(meta.height) {
+            state.ptrs_mut().state.inner()
+                .ok()
+                .and_then(|s| s.compute_root().ok())
+        } else {
+            None
+        };
+
         Ok(vec![RootAnchor {
-            root,
+            spaces_root,
+            ptrs_root,
             block: ChainAnchor {
                 hash: meta.hash,
                 height: meta.height,
@@ -1788,6 +1924,20 @@ impl AsyncChainState {
         resp_rx.await?
     }
 
+    pub async fn get_ptr_block_meta(
+        &self,
+        height_or_hash: HeightOrHash,
+    ) -> anyhow::Result<PtrBlockMetaWithHash> {
+        let (resp, resp_rx) = oneshot::channel();
+        self.sender
+            .send(ChainStateCommand::GetPtrBlockMeta {
+                height_or_hash,
+                resp,
+            })
+            .await?;
+        resp_rx.await?
+    }
+
     pub async fn get_tx_meta(&self, txid: Txid) -> anyhow::Result<Option<TxEntry>> {
         let (resp, resp_rx) = oneshot::channel();
         self.sender
@@ -1864,7 +2014,12 @@ fn get_delegation(state: &mut Chain, space: SLabel) -> anyhow::Result<Option<Spt
     };
     let sptr = Sptr::from_spk::<Sha256>(info.spaceout.script_pubkey);
     let delegate = state.get_delegator(&RegistrySptrKey::from_sptr::<Sha256>(sptr))?;
-    Ok(delegate.map(|_| sptr))
+
+    // Only return the SPTR if the reverse mapping points back to this space
+    match delegate {
+        Some(delegator) if delegator == space => Ok(Some(sptr)),
+        _ => Ok(None),
+    }
 }
 
 fn get_commitment(state: &mut Chain, space: SLabel, root: Option<Hash>) -> anyhow::Result<Option<Commitment>> {

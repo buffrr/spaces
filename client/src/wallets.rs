@@ -37,12 +37,14 @@ use tokio::{
 };
 use spaces_protocol::bitcoin::address::ParseError;
 use spaces_protocol::bitcoin::{Network, ScriptBuf};
+use spaces_ptr::{PtrSource, RegistrySptrKey};
 use spaces_ptr::sptr::{Sptr, SptrParseError, SPTR_HRP};
 use spaces_wallet::builder::{CommitmentRequest, PtrRequest, PtrTransfer};
 use crate::{calc_progress, checker::TxChecker, client::BlockSource, config::ExtendedNetwork, rpc::{RpcWalletRequest, RpcWalletTxBuilder, WalletLoadRequest}, source::{
     BitcoinBlockSource, BitcoinRpc, BitcoinRpcError, BlockEvent, BlockFetchError, BlockFetcher,
 }, std_wait};
 use crate::cbf::{CompactFilterSync};
+use crate::rpc::CommitParams;
 use crate::spaces::Spaced;
 use crate::store::chain::Chain;
 use crate::store::Sha256;
@@ -303,6 +305,30 @@ impl spaces_wallet::Mempool for MempoolChecker<'_> {
     fn in_mempool(&self, txid: &Txid, height: u32) -> anyhow::Result<bool> {
         Ok(self.0.in_mempool(txid, height)?)
     }
+}
+
+fn commit_params_to_req(chain: &mut Chain, wallet: &SpacesWallet, p: CommitParams) -> anyhow::Result<CommitmentRequest> {
+    let space_key = SpaceKey::from(Sha256::hash(p.space.as_ref()));
+    let info = match chain.get_space_info(&space_key)? {
+        None => return Err(anyhow!("commit: no such space {}", p.space)),
+        Some(info) => info,
+    };
+    let sptr = Sptr::from_spk::<Sha256>(info.spaceout.script_pubkey.clone());
+    let ptr_info = match chain.get_ptr_info(&sptr)? {
+        None => return Err(anyhow!("commit: sptr {} doesn't exist for space {} - have you created it?", sptr, p.space)),
+        Some(pt) => pt,
+    };
+    if info.spaceout.space.is_none()
+        || !info.spaceout.space.as_ref().unwrap().is_owned()
+        || !wallet.is_mine(ptr_info.ptrout.script_pubkey.clone())
+    {
+        return Err(anyhow!("commit: you don't control `{}`", sptr));
+    }
+
+    Ok(CommitmentRequest {
+        ptrout: ptr_info,
+        root: p.root.map(|p| *p.as_ref()),
+    })
 }
 
 impl RpcWallet {
@@ -1136,6 +1162,7 @@ impl RpcWallet {
                                 builder = builder.add_transfer(SpaceTransfer {
                                     space: full,
                                     recipient: recipient.clone(),
+                                    create_ptr: false,
                                 });
                             }
                         };
@@ -1252,6 +1279,7 @@ impl RpcWallet {
                         spaces.push(SpaceTransfer {
                             space: spaceout,
                             recipient: address,
+                            create_ptr: false,
                         });
                     }
 
@@ -1279,32 +1307,65 @@ impl RpcWallet {
                         .map_err(|e| anyhow!("transferptr: invalid spk: {:?}", e))?;
 
                     let spk = ScriptBuf::from(spk_raw);
+                    let sptr = Sptr::from_spk::<Sha256>(spk.clone());
+
+                    let sptr = chain.get_ptr_info(&sptr)?;
+                    if sptr.is_some() && !tx.force {
+                        return Err(anyhow!("sptr already exists"));
+                    }
+
                     builder = builder.add_ptr(PtrRequest {
                         spk,
                     })
                 }
                 RpcWalletRequest::Commit(params) => {
-                    let space_key = SpaceKey::from(Sha256::hash(params.space.as_ref()));
-                    let info = match chain.get_space_info(&space_key)? {
-                        None => return Err(anyhow!("commit: no such space {}", params.space)),
-                        Some(info) => info,
-                    };
-                    let sptr = Sptr::from_spk::<Sha256>(info.spaceout.script_pubkey.clone());
-                    let ptr_info = match chain.get_ptr_info(&sptr)? {
-                        None => return Err(anyhow!("commit: sptr {} doesn't exists for space {} - have you created it?", sptr, params.space)),
-                        Some(pt) => pt,
-                    };
-                    if info.spaceout.space.is_none()
-                        || !info.spaceout.space.as_ref().unwrap().is_owned()
-                        || !wallet.is_mine(ptr_info.ptrout.script_pubkey.clone())
-                    {
-                        return Err(anyhow!("commit: you don't control `{}`", sptr));
-                    }
+                    let reqs = commit_params_to_req(chain, wallet, params)?;
+                    builder = builder.add_commitment(reqs)
+                }
+                RpcWalletRequest::Delegate(params) => {
+                    let space = params.space;
+                    let spacehash = SpaceKey::from(Sha256::hash(space.as_ref()));
 
-                    builder = builder.add_commitment(CommitmentRequest {
-                        ptrout: ptr_info,
-                        root: *params.root.as_ref()
-                    })
+                    // Validate space exists and is owned
+                    let full = match chain.get_space_info(&spacehash)? {
+                        None => return Err(anyhow!("delegate: space '{}' not found", space)),
+                        Some(full) if full.spaceout.space.is_none()
+                            || !full.spaceout.space.as_ref().unwrap().is_owned()
+                            || !wallet.is_mine(full.spaceout.script_pubkey.clone()) => {
+                            return Err(anyhow!("delegate: you don't own '{}'", space))
+                        }
+                        Some(full) if wallet.get_utxo(full.outpoint()).is_none() => {
+                            return Err(anyhow!(
+                                "delegate '{}': wallet already has a pending tx for this space",
+                                space
+                            ))
+                        }
+                        Some(full) => full,
+                    };
+
+                    // Generate fresh unique address and verify SPTR is available
+                    let recipient = loop {
+                        let addr = wallet.reveal_next_space_address();
+                        let spk = addr.script_pubkey();
+                        let sptr = Sptr::from_spk::<Sha256>(spk);
+                        let rsk = RegistrySptrKey::from_sptr::<Sha256>(sptr);
+
+                        // Check if SPTR is already taken
+                        match chain.get_delegator(&rsk)? {
+                            None => break addr, // SPTR is free, use this address
+                            Some(_) => {
+                                // Collision! This SPTR is already delegated, try next address
+                                continue;
+                            }
+                        }
+                    };
+
+                    // Add transfer to builder (establishes/updates delegation and creates PTR)
+                    builder = builder.add_transfer(SpaceTransfer {
+                        space: full,
+                        recipient,
+                        create_ptr: true,
+                    });
                 }
             }
         }

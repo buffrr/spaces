@@ -2384,6 +2384,7 @@ dependencies = [
  "bech32",
  "bincode",
  "bitcoin",
+ "hex",
  "log",
  "rand",
  "serde",
