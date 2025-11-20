@@ -2,7 +2,6 @@
 pub mod sptr;
 pub mod constants;
 
-use std::collections::BTreeMap;
 #[cfg(feature = "bincode")]
 use bincode::{Decode, Encode};
 
@@ -47,18 +46,27 @@ pub struct TxChangeSet {
     /// List of transaction outputs creating a ptrout.
     pub creates: Vec<PtrOut>,
     /// New commitments made
-    pub commitments: BTreeMap<SLabel, Commitment>,
-    pub revoked_commitments: Vec<CommitmentKey>,
-    pub revoked_delegations: Vec<RegistrySptrKey>,
-    pub new_delegations: Vec<Delegation>,
+    pub commitments: Vec<CommitmentInfo>,
+    pub revoked_commitments: Vec<CommitmentInfo>,
+    pub revoked_delegations: Vec<DelegationInfo>,
+    pub new_delegations: Vec<DelegationInfo>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "bincode", derive(Encode, Decode))]
-pub struct Delegation {
+pub struct CommitmentInfo {
     pub space: SLabel,
-    pub sptr_key: RegistrySptrKey,
+    #[cfg_attr(feature = "serde", serde(flatten))]
+    pub commitment: Commitment,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "bincode", derive(Encode, Decode))]
+pub struct DelegationInfo {
+    pub space: SLabel,
+    pub sptr: Sptr,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -383,7 +391,7 @@ impl Validator {
             txid: tx.compute_txid(),
             spends: vec![],
             creates: vec![],
-            commitments: BTreeMap::new(),
+            commitments: vec![],
             revoked_commitments: vec![],
             revoked_delegations: vec![],
             new_delegations: vec![],
@@ -394,29 +402,37 @@ impl Validator {
         // Remove sptr -> space mappings if a space is spent
         changeset.revoked_delegations = spent_space_utxos
             .into_iter()
-            .map(|spent| {
-                let sptr = Sptr::from_spk::<H>(spent.script_pubkey);
-                RegistrySptrKey::from_sptr::<H>(sptr)
+            .filter_map(|spent| {
+                spent.space.as_ref().map(|space| {
+                    let sptr = Sptr::from_spk::<H>(spent.script_pubkey);
+                    DelegationInfo {
+                        space: space.name.clone(),
+                        sptr,
+                    }
+                })
             })
             .collect();
 
         // Allow revoked sptrs to be redefined
-        ctx.sptrs_with_delegations.retain(|rsk| !changeset.revoked_delegations.contains(rsk));
+        let revoked_keys: Vec<RegistrySptrKey> = changeset.revoked_delegations
+            .iter()
+            .map(|rd| RegistrySptrKey::from_sptr::<H>(rd.sptr))
+            .collect();
+        ctx.sptrs_with_delegations.retain(|rsk| !revoked_keys.contains(rsk));
 
         // Process new delegations from created space UTXOs
         changeset.new_delegations = new_space_utxos
             .iter()
             .filter_map(|created| {
-                let rsk =  RegistrySptrKey::from_sptr::<H>(
-                    Sptr::from_spk::<H>(created.script_pubkey.clone())
-                );
+                let sptr = Sptr::from_spk::<H>(created.script_pubkey.clone());
+                let rsk = RegistrySptrKey::from_sptr::<H>(sptr);
                 if ctx.sptrs_with_delegations.contains(&rsk) {
                     return None;
                 }
                 created.space.as_ref().map(|space| {
-                    Delegation {
+                    DelegationInfo {
                         space: space.name.clone(),
-                        sptr_key: rsk,
+                        sptr,
                     }
                 })
             })
@@ -436,7 +452,10 @@ impl Validator {
                         if let Some(pending) = delegate.pending_tip {
                             if !pending.is_finalized(height) {
                                 changeset.revoked_commitments.push(
-                                    CommitmentKey::new::<H>(&delegate.space, pending.state_root)
+                                    CommitmentInfo {
+                                        space: delegate.space.clone(),
+                                        commitment: pending,
+                                    }
                                 );
                             }
                         }
@@ -463,10 +482,16 @@ impl Validator {
                             // Revoke pending commitment
                             if let Some(pending) = delegate.pending_tip {
                                 changeset.revoked_commitments.push(
-                                    CommitmentKey::new::<H>(&delegate.space, pending.state_root)
+                                    CommitmentInfo {
+                                        space: delegate.space.clone(),
+                                        commitment: pending,
+                                    }
                                 );
                             }
-                            changeset.commitments.insert(delegate.space, commitment);
+                            changeset.commitments.push(CommitmentInfo {
+                                space: delegate.space,
+                                commitment,
+                            });
                         }
                     }
                     None => {}

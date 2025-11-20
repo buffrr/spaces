@@ -15,7 +15,7 @@ use spaces_protocol::{
     validate::{TxChangeSet, UpdateKind, Validator},
     Bytes, Covenant, FullSpaceOut, RevokeReason, SpaceOut,
 };
-use spaces_ptr::{CommitmentKey, RegistryKey};
+use spaces_ptr::{CommitmentKey, RegistryKey, RegistrySptrKey};
 use spaces_wallet::bitcoin::{Network, Transaction};
 
 use crate::{
@@ -307,28 +307,31 @@ impl Client {
         }
 
         // Remove revoked delegations
-        for reverse in changeset.revoked_delegations {
-            state.remove_delegation(reverse);
+        for revoked in changeset.revoked_delegations {
+            let sptr_key = RegistrySptrKey::from_sptr::<Sha256>(revoked.sptr);
+            state.remove_delegation(sptr_key);
         }
         // Remove revoked commitments
         for revoked in changeset.revoked_commitments {
-            state.remove_commitment(revoked);
+            let commitment_key = CommitmentKey::new::<Sha256>(&revoked.space, revoked.commitment.state_root);
+            state.remove_commitment(commitment_key);
         }
 
         // Create new delegations
         for delegation in changeset.new_delegations {
-            state.insert_delegation(delegation.sptr_key, delegation.space);
+            let sptr_key = RegistrySptrKey::from_sptr::<Sha256>(delegation.sptr);
+            state.insert_delegation(sptr_key, delegation.space);
         }
 
         // Insert new commitments
-        for (space, commitment) in changeset.commitments {
-            let commitment_key = CommitmentKey::new::<Sha256>(&space, commitment.state_root);
-            let registry_key = RegistryKey::from_slabel::<Sha256>(&space);
+        for commitment_info in changeset.commitments {
+            let commitment_key = CommitmentKey::new::<Sha256>(&commitment_info.space, commitment_info.commitment.state_root);
+            let registry_key = RegistryKey::from_slabel::<Sha256>(&commitment_info.space);
 
             // Points space -> commitments tip
-            state.insert_registry(registry_key, commitment.state_root);
+            state.insert_registry(registry_key, commitment_info.commitment.state_root);
             // commitment key = HASH(HASH(space) || state root) -> commitment
-            state.insert_commitment(commitment_key, commitment);
+            state.insert_commitment(commitment_key, commitment_info.commitment);
 
         }
 
