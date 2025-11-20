@@ -4,10 +4,10 @@
 
 ### 1. Initialize the Space
 
-Initialize your space for operation:
+Delegate your space to a UTXO that can be used to submit commitments:
 
 ```bash
-$ space-cli operate @bitcoin
+$ space-cli delegate @bitcoin
 ```
 
 ### 2. Issue Subspaces
@@ -57,12 +57,12 @@ $ space-cli getcommitment @bitcoin
 ```
 
 
-### Delegating Operational Control
+### Authorizing Operational Control
 
-You can authorize another party to make commitments on your behalf:
+You can authorize another party to make commitments on your behalf by transferring the space pointer:
 
 ```bash
-$ space-cli delegate @bitcoin --to <operator-address>
+$ space-cli authorize @bitcoin --to <operator-address>
 ```
 
 ## Binding Handles On-Chain

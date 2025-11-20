@@ -35,7 +35,7 @@ use spaces_client::{
     serialize_base64,
     wallets::{AddressKind, WalletResponse},
 };
-use spaces_client::rpc::{CommitParams, CreatePtrParams, TransferPtrParams};
+use spaces_client::rpc::{CommitParams, CreatePtrParams, DelegateParams, TransferPtrParams};
 use spaces_client::store::Sha256;
 use spaces_protocol::bitcoin::{Amount, FeeRate, OutPoint, Txid};
 use spaces_protocol::slabel::SLabel;
@@ -210,9 +210,9 @@ enum Commands {
         fee_rate: Option<u64>,
     },
     /// Initialize a space for operation of off-chain subspaces
-    #[command(name = "operate")]
-    Operate {
-        /// The space to apply new root
+    #[command(name = "delegate")]
+    Delegate {
+        /// The space to delegate
         space: String,
         /// Fee rate to use in sat/vB
         #[arg(long, short)]
@@ -230,9 +230,9 @@ enum Commands {
         fee_rate: Option<u64>,
     },
     /// Delegate operation of a space to someone else
-    #[command(name = "delegate")]
-    Delegate {
-        /// Ptrs to send
+    #[command(name = "authorize")]
+    Authorize {
+        /// Space to authorize
         #[arg(display_order = 0)]
         space: String,
         /// Recipient space name or address (must be a space address)
@@ -1110,47 +1110,30 @@ async fn handle_commands(cli: &SpaceCli, command: Commands) -> Result<(), Client
                 .map_err(|e| ClientError::Custom(e.to_string()))?;
             println!("{}", serde_json::to_string(&ptrout).expect("result"));
         }
-        Commands::Operate { space, fee_rate } => {
+        Commands::Delegate { space, fee_rate } => {
             let space_info = match cli.client.get_space(&space).await? {
                 Some(space_info) => space_info,
                 None => return Err(ClientError::Custom("no such space".to_string()))
             };
             let commitments_tip = cli.client.get_commitment(
                 space_info.spaceout.space.as_ref().expect("space").name.clone(),
-                                                            None
+                None
             ).await?;
             if commitments_tip.is_some() {
-                return Err(ClientError::Custom("space is already operational".to_string()));
+                return Err(ClientError::Custom("space is already delegated".to_string()));
             }
-            
-            let address = cli.client.wallet_get_new_address(&cli.wallet, AddressKind::Space).await?;
-            let address = SpaceAddress::from_str(&address)
-                .expect("valid");
-            let spk = address.script_pubkey();
-            let sptr = Sptr::from_spk::<Sha256>(spk.clone());
 
-            println!("Assigning space to sptr {}", sptr);
+            println!("Delegating space {}", space);
             cli.send_request(
-                Some(RpcWalletRequest::Transfer(TransferSpacesParams {
-                    spaces: vec![space],
-                    to: Some(address.to_string()),
+                Some(RpcWalletRequest::Delegate(DelegateParams {
+                    space: space_info.spaceout.space.as_ref().expect("space").name.clone(),
                 })),
                 None,
                 fee_rate,
                 false,
             )
                 .await?;
-            println!("Creating UTXO for sptr {}", sptr);
-            cli.send_request(
-                Some(RpcWalletRequest::CreatePtr(CreatePtrParams {
-                    spk: hex::encode(spk.as_bytes()),
-                })),
-                None,
-                fee_rate,
-                false,
-            )
-                .await?;
-            println!("Space should be operational once txs are confirmed");
+            println!("Space delegation should be complete once tx is confirmed");
         }
         Commands::Commit { space, root, fee_rate } => {
             let space_info = match cli.client.get_space(&space).await? {
@@ -1174,7 +1157,7 @@ async fn handle_commands(cli: &SpaceCli, command: Commands) -> Result<(), Client
             )
                 .await?;
         }
-        Commands::Delegate { space, to, fee_rate } => {
+        Commands::Authorize { space, to, fee_rate } => {
             let space_info = match cli.client.get_space(&space).await? {
                 Some(space_info) => space_info,
                 None => return Err(ClientError::Custom("no such space".to_string()))
