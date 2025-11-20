@@ -41,7 +41,6 @@ use spaces_protocol::bitcoin::{Amount, FeeRate, OutPoint, Txid};
 use spaces_protocol::slabel::SLabel;
 use spaces_ptr::sptr::Sptr;
 use spaces_wallet::{bitcoin::secp256k1::schnorr::Signature, export::WalletExport, nostr::{NostrEvent, NostrTag}, Listing};
-use spaces_wallet::address::SpaceAddress;
 use spaces_wallet::bitcoin::hashes::sha256;
 use spaces_wallet::bitcoin::ScriptBuf;
 
@@ -225,6 +224,15 @@ enum Commands {
         space: String,
         /// The new state root
         root: sha256::Hash,
+        /// Fee rate to use in sat/vB
+        #[arg(long, short)]
+        fee_rate: Option<u64>,
+    },
+    /// Rollback the last pending commitment
+    #[command(name = "rollback")]
+    Rollback {
+        /// The space to rollback
+        space: String,
         /// Fee rate to use in sat/vB
         #[arg(long, short)]
         fee_rate: Option<u64>,
@@ -1157,6 +1165,29 @@ async fn handle_commands(cli: &SpaceCli, command: Commands) -> Result<(), Client
             )
                 .await?;
         }
+        Commands::Rollback { space, fee_rate } => {
+            let space_info = match cli.client.get_space(&space).await? {
+                Some(space_info) => space_info,
+                None => return Err(ClientError::Custom("no such space".to_string()))
+            };
+
+            let label = space_info.spaceout.space.as_ref().expect("space").name.clone();
+            let delegation = cli.client.get_delegation(label.clone()).await?;
+            if delegation.is_none() {
+                return Err(ClientError::Custom("space is not delegated - use delegate @<your-space> first.".to_string()));
+            }
+            cli.send_request(
+                Some(RpcWalletRequest::Commit(CommitParams {
+                    space: label.clone(),
+                    root: None,
+                })),
+                None,
+                fee_rate,
+                false,
+            )
+                .await?;
+            println!("Rollback transaction sent");
+        }
         Commands::Authorize { space, to, fee_rate } => {
             let space_info = match cli.client.get_space(&space).await? {
                 Some(space_info) => space_info,
@@ -1166,7 +1197,7 @@ async fn handle_commands(cli: &SpaceCli, command: Commands) -> Result<(), Client
             let label = space_info.spaceout.space.as_ref().expect("space").name.clone();
             let delegation = cli.client.get_delegation(label.clone()).await?;
             if delegation.is_none() {
-                return Err(ClientError::Custom("space is not operational - use operate @<your-space> first.".to_string()));
+                return Err(ClientError::Custom("space is not delegated - use delegate @<your-space> first.".to_string()));
             }
             let delegation = delegation.unwrap();
 
