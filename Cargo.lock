@@ -2419,6 +2419,7 @@ dependencies = [
  "ring",
  "spacedb",
  "spaces_protocol",
+ "spaces_ptr",
  "wasm-bindgen",
 ]
 

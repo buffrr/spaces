@@ -12,9 +12,13 @@ mod wasm_api {
         slabel::SLabel as NativeSLabel,
         Covenant as NativeCovenant, Space as NativeSpace, SpaceOut as NativeSpaceOut,
     };
+    use spaces_ptr::{
+        Commitment as NativeCommitment, Ptr as NativePtr, PtrOut as NativePtrOut,
+        sptr::Sptr as NativeSptr,
+    };
     use wasm_bindgen::prelude::*;
 
-    use crate::{Error, Proof as ProofNative, Value as ValueNative, Veritas as VeritasNative};
+    use crate::{Error, Proof as ProofNative, ProofType as ProofTypeNative, Value as ValueNative, Veritas as VeritasNative};
 
     #[wasm_bindgen]
     pub struct Veritas {
@@ -58,6 +62,26 @@ mod wasm_api {
         signature: Vec<u8>,
         total_burned: u64,
         claim_height: Option<u32>,
+    }
+
+    #[wasm_bindgen]
+    pub struct PtrOut {
+        inner: NativePtrOut,
+    }
+
+    #[wasm_bindgen]
+    pub struct Ptr {
+        inner: NativePtr,
+    }
+
+    #[wasm_bindgen]
+    pub struct Sptr {
+        inner: NativeSptr,
+    }
+
+    #[wasm_bindgen]
+    pub struct Commitment {
+        inner: NativeCommitment,
     }
 
     #[wasm_bindgen]
@@ -221,13 +245,110 @@ mod wasm_api {
     }
 
     #[wasm_bindgen]
+    impl Sptr {
+        #[wasm_bindgen(constructor)]
+        pub fn new(sptr: &str) -> Result<Self, JsValue> {
+            Ok(Self {
+                inner: NativeSptr::from_str(sptr)
+                    .map_err(|err| JsValue::from_str(&format!("{:?}", err)))?,
+            })
+        }
+
+        #[wasm_bindgen(js_name = "toString")]
+        pub fn to_string(&self) -> String {
+            self.inner.to_string()
+        }
+
+        #[wasm_bindgen(js_name = "toBytes")]
+        pub fn to_bytes(&self) -> Vec<u8> {
+            self.inner.to_bytes().to_vec()
+        }
+    }
+
+    #[wasm_bindgen]
+    impl PtrOut {
+        #[wasm_bindgen(js_name = "fromBytes")]
+        pub fn from_bytes(data: &[u8]) -> Result<PtrOut, JsValue> {
+            let (native, _): (NativePtrOut, _) =
+                bincode::decode_from_slice(data, bincode::config::standard())
+                    .map_err(|e| JsValue::from_str(&format!("Deserialization error: {:?}", e)))?;
+            Ok(PtrOut { inner: native })
+        }
+
+        #[wasm_bindgen(js_name = "getScriptPubkey")]
+        pub fn get_script_pubkey(&self) -> Vec<u8> {
+            self.inner.script_pubkey.to_bytes()
+        }
+
+        #[wasm_bindgen(js_name = "getPublicKey")]
+        pub fn get_public_key(&self) -> Option<Vec<u8>> {
+            match self.inner.script_pubkey.is_p2tr() {
+                true => Some(self.inner.script_pubkey.as_bytes()[2..].to_vec()),
+                false => None,
+            }
+        }
+
+        #[wasm_bindgen(js_name = "getValue")]
+        pub fn get_value(&self) -> u64 {
+            self.inner.value.to_sat()
+        }
+
+        #[wasm_bindgen(js_name = "getPtr")]
+        pub fn get_ptr(&self) -> Option<Ptr> {
+            self.inner.sptr.clone().map(|p| Ptr { inner: p })
+        }
+    }
+
+    #[wasm_bindgen]
+    impl Ptr {
+        #[wasm_bindgen(js_name = "getId")]
+        pub fn get_id(&self) -> Sptr {
+            Sptr {
+                inner: self.inner.id.clone(),
+            }
+        }
+
+        #[wasm_bindgen(js_name = "getLastUpdate")]
+        pub fn get_last_update(&self) -> u32 {
+            self.inner.last_update
+        }
+    }
+
+    #[wasm_bindgen]
+    impl Commitment {
+        #[wasm_bindgen(js_name = "fromBytes")]
+        pub fn from_bytes(data: &[u8]) -> Result<Commitment, JsValue> {
+            let (native, _): (NativeCommitment, _) =
+                bincode::decode_from_slice(data, bincode::config::standard())
+                    .map_err(|e| JsValue::from_str(&format!("Deserialization error: {:?}", e)))?;
+            Ok(Commitment { inner: native })
+        }
+
+        #[wasm_bindgen(js_name = "getRoot")]
+        pub fn get_root(&self) -> Vec<u8> {
+            self.inner.root.to_vec()
+        }
+
+        #[wasm_bindgen(js_name = "getBlockHeight")]
+        pub fn get_block_height(&self) -> u32 {
+            self.inner.block_height
+        }
+    }
+
+    #[wasm_bindgen]
     impl Veritas {
         /// Creates a new Veritas instance.
+        /// proof_type: "spaces" or "ptrs"
         #[wasm_bindgen(constructor)]
-        pub fn new() -> Veritas {
-            Veritas {
-                inner: VeritasNative::new(),
-            }
+        pub fn new(proof_type: &str) -> Result<Veritas, JsValue> {
+            let pt = match proof_type {
+                "spaces" => ProofTypeNative::Spaces,
+                "ptrs" => ProofTypeNative::Ptrs,
+                _ => return Err(JsValue::from_str("proof_type must be 'spaces' or 'ptrs'")),
+            };
+            Ok(Veritas {
+                inner: VeritasNative::new(pt),
+            })
         }
 
         /// Adds an anchor.
@@ -287,6 +408,55 @@ mod wasm_api {
                 .map(|out| SpaceOut { inner: out }))
         }
 
+        #[wasm_bindgen(js_name = "findPtr")]
+        pub fn find_ptr(&self, sptr: &Sptr) -> Result<Option<PtrOut>, JsValue> {
+            Ok(self
+                .inner
+                .find_ptr(&sptr.inner)
+                .map_err(|e| error_to_jsvalue(e))?
+                .map(|out| PtrOut { inner: out }))
+        }
+
+        #[wasm_bindgen(js_name = "getPtrout")]
+        pub fn get_ptrout(&self, utxo_key: &[u8]) -> Result<Option<PtrOut>, JsValue> {
+            let hash = read_hash(utxo_key)?;
+            Ok(self
+                .inner
+                .get_ptrout(&hash)
+                .map_err(|e| error_to_jsvalue(e))?
+                .map(|out| PtrOut { inner: out }))
+        }
+
+        #[wasm_bindgen(js_name = "getCommitment")]
+        pub fn get_commitment(&self, commitment_key: &[u8]) -> Result<Option<Commitment>, JsValue> {
+            let hash = read_hash(commitment_key)?;
+            Ok(self
+                .inner
+                .get_commitment(&hash)
+                .map_err(|e| error_to_jsvalue(e))?
+                .map(|c| Commitment { inner: c }))
+        }
+
+        #[wasm_bindgen(js_name = "getDelegation")]
+        pub fn get_delegation(&self, sptr_key: &[u8]) -> Result<Option<SLabel>, JsValue> {
+            let hash = read_hash(sptr_key)?;
+            Ok(self
+                .inner
+                .get_delegation(&hash)
+                .map_err(|e| error_to_jsvalue(e))?
+                .map(|s| SLabel { inner: s }))
+        }
+
+        #[wasm_bindgen(js_name = "getRegistryTip")]
+        pub fn get_registry_tip(&self, registry_key: &[u8]) -> Result<Option<Vec<u8>>, JsValue> {
+            let hash = read_hash(registry_key)?;
+            Ok(self
+                .inner
+                .get_registry_tip(&hash)
+                .map_err(|e| error_to_jsvalue(e))?
+                .map(|h| h.to_vec()))
+        }
+
         /// Returns all proof entries as an array of objects.
         #[wasm_bindgen]
         pub fn entries(&self) -> Result<JsValue, JsValue> {
@@ -303,6 +473,18 @@ mod wasm_api {
                     ValueNative::UTXO(ref utxo) => JsValue::from(SpaceOut {
                         inner: utxo.clone(),
                     }),
+                    ValueNative::PtrUTXO(ref ptrout) => JsValue::from(PtrOut {
+                        inner: ptrout.clone(),
+                    }),
+                    ValueNative::Commitment(ref commitment) => JsValue::from(Commitment {
+                        inner: commitment.clone(),
+                    }),
+                    ValueNative::Space(ref space) => JsValue::from(SLabel {
+                        inner: space.clone(),
+                    }),
+                    ValueNative::Root(ref root) => {
+                        JsValue::from(js_sys::Uint8Array::from(&root[..]))
+                    },
                     ValueNative::Unknown(ref bytes) => {
                         JsValue::from(js_sys::Uint8Array::from(&bytes[..]))
                     }

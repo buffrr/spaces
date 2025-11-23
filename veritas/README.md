@@ -17,12 +17,12 @@ Veritas is a <strong>stateless way</strong> to verify <strong><a href="https://s
 
 ---
 
-## Javascript Example
+## Javascript Examples
 
-### Verifying proofs
+### Verifying Spaces proofs
 
 ```javascript
-const veritas = new Veritas();
+const veritas = new Veritas("spaces");
 
 // Set up a trust anchor
 const root = Buffer.from(
@@ -47,10 +47,10 @@ for (const {key, value: utxo} of proof.entries()) {
 }
 ```
 
-### Verifying messages
+### Verifying Spaces messages
 
 ```javascript
-const veritas = new Veritas();
+const veritas = new Veritas("spaces");
 
 // Set up a trust anchor
 const anchor = Buffer.from(
@@ -84,6 +84,55 @@ console.log("✅ Verified message:", msg.toString("utf-8"));
 console.log("- Signed by: ", space.toString());
 console.log("- Public Key:", Buffer.from(utxo.getPublicKey()).toString("hex"));
 console.log("- Signature: ", sig.toString('hex'));
+```
+
+### Verifying PTR proofs
+
+```javascript
+const veritas = new Veritas("ptrs");
+
+// Set up a PTR trust anchor
+const root = Buffer.from(
+    "b55cd9bda4295a18d75f79c9d60efcd78ee2cdf661b0df4b054ff7602bc70794",
+    "hex"
+);
+veritas.addAnchor(root);
+
+const rawProof = Buffer.from(
+    "...", // PTR proof bytes
+    "base64"
+);
+
+// Verify a PTR proof
+const proof = veritas.verifyProof(rawProof);
+
+// Find a PTR by its identifier
+const sptr = new Sptr("sptr1...");
+const ptrout = proof.findPtr(sptr);
+if (ptrout) {
+    console.log('✅ SPTR found');
+    console.log('🔑 Public key: ', Buffer.from(ptrout.getPublicKey()).toString('hex'));
+    const ptr = ptrout.getPtr();
+    if (ptr) {
+        console.log('📍 SPTR ID: ', ptr.getId().toString());
+        console.log('📅 Last update: ', ptr.getLastUpdate());
+    }
+}
+
+// Get a commitment by its key
+const commitmentKey = Buffer.from("...", "hex");
+const commitment = proof.getCommitment(commitmentKey);
+if (commitment) {
+    console.log('✅ Commitment root: ', Buffer.from(commitment.getRoot()).toString('hex'));
+    console.log('📅 Block height: ', commitment.getBlockHeight());
+}
+
+// Get delegated space for an SPTR
+const sptrKey = Buffer.from("...", "hex");
+const delegatedSpace = proof.getDelegation(sptrKey);
+if (delegatedSpace) {
+    console.log('✅ Delegated to space: ', delegatedSpace.toString());
+}
 ```
 
 

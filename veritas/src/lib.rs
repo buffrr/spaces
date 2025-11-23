@@ -19,28 +19,42 @@ use spaces_protocol::{
     slabel::SLabel,
     SpaceOut,
 };
+use spaces_ptr::{PtrOut, Commitment, sptr::Sptr};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofType {
+    Spaces,
+    Ptrs,
+}
 
 pub struct Veritas {
     anchors: BTreeSet<hasher::Hash>,
+    proof_type: ProofType,
     ctx: Secp256k1<VerifyOnly>,
 }
 
 pub struct Proof {
     root: Hash,
+    proof_type: ProofType,
     inner: SubTree<Sha256Hasher>,
 }
 
 pub struct ProofIter<'a> {
+    proof_type: ProofType,
     inner: SubtreeIter<'a>,
 }
 
 pub enum Value {
     Outpoint(OutPoint),
     UTXO(SpaceOut),
+    PtrUTXO(PtrOut),
+    Commitment(Commitment),
+    Space(SLabel),
+    Root(hasher::Hash),
     Unknown(Vec<u8>),
 }
 
-pub trait SpaceoutExt {
+pub trait UtxoExt {
     fn public_key(&self) -> Option<XOnlyPublicKey>;
 }
 
@@ -58,9 +72,10 @@ pub enum Error {
 }
 
 impl Veritas {
-    pub fn new() -> Self {
+    pub fn new(proof_type: ProofType) -> Self {
         Self {
             anchors: BTreeSet::new(),
+            proof_type,
             ctx: Secp256k1::verification_only(),
         }
     }
@@ -76,7 +91,11 @@ impl Veritas {
         if !self.anchors.contains(&root) {
             return Err(Error::NoMatchingAnchor);
         }
-        Ok(Proof { root, inner })
+        Ok(Proof {
+            root,
+            proof_type: self.proof_type.clone(),
+            inner
+        })
     }
 
     pub fn verify_schnorr(&self, pubkey: &[u8], digest: &[u8], sig: &[u8]) -> bool {
@@ -105,6 +124,7 @@ impl Veritas {
 impl Proof {
     pub fn iter(&self) -> ProofIter {
         ProofIter {
+            proof_type: self.proof_type,
             inner: self.inner.iter(),
         }
     }
@@ -146,6 +166,69 @@ impl Proof {
         }
         Ok(None)
     }
+
+    /// Retrieves a PTR UTXO leaf within the subtree specified by the outpoint hash
+    pub fn get_ptrout(&self, utxo_key: &Hash) -> Result<Option<PtrOut>, Error> {
+        let (_, value) = match self.inner.iter().find(|(k, _)| *k == utxo_key) {
+            None => return Ok(None),
+            Some(kv) => kv,
+        };
+        let (ptrout, _): (PtrOut, _) = bincode::decode_from_slice(value, config::standard())
+            .map_err(|_| Error::MalformedValue)?;
+        Ok(Some(ptrout))
+    }
+
+    /// Retrieves a PTR UTXO leaf containing the specified sptr
+    pub fn find_ptr(&self, sptr: &Sptr) -> Result<Option<PtrOut>, Error> {
+        for (_, v) in self.iter() {
+            match v {
+                Value::PtrUTXO(ptrout) => {
+                    if ptrout
+                        .sptr
+                        .as_ref()
+                        .is_some_and(|ptr| &ptr.id == sptr)
+                    {
+                        return Ok(Some(ptrout));
+                    }
+                }
+                _ => continue,
+            }
+        }
+        Ok(None)
+    }
+
+    /// Retrieves a commitment by its key
+    pub fn get_commitment(&self, commitment_key: &Hash) -> Result<Option<Commitment>, Error> {
+        let (_, value) = match self.inner.iter().find(|(k, _)| *k == commitment_key) {
+            None => return Ok(None),
+            Some(kv) => kv,
+        };
+        let (commitment, _): (Commitment, _) = bincode::decode_from_slice(value, config::standard())
+            .map_err(|_| Error::MalformedValue)?;
+        Ok(Some(commitment))
+    }
+
+    /// Retrieves the delegated space for an SPTR
+    pub fn get_delegation(&self, sptr_key: &Hash) -> Result<Option<SLabel>, Error> {
+        let (_, value) = match self.inner.iter().find(|(k, _)| *k == sptr_key) {
+            None => return Ok(None),
+            Some(kv) => kv,
+        };
+        let (space, _): (SLabel, _) = bincode::decode_from_slice(value, config::standard())
+            .map_err(|_| Error::MalformedValue)?;
+        Ok(Some(space))
+    }
+
+    /// Retrieves the latest commitment root for a space
+    pub fn get_registry_tip(&self, registry_key: &Hash) -> Result<Option<hasher::Hash>, Error> {
+        let (_, value) = match self.inner.iter().find(|(k, _)| *k == registry_key) {
+            None => return Ok(None),
+            Some(kv) => kv,
+        };
+        let (root, _): (hasher::Hash, _) = bincode::decode_from_slice(value, config::standard())
+            .map_err(|_| Error::MalformedValue)?;
+        Ok(Some(root))
+    }
 }
 
 impl From<spacedb::Error> for Error {
@@ -161,7 +244,16 @@ impl From<spacedb::Error> for Error {
     }
 }
 
-impl SpaceoutExt for SpaceOut {
+impl UtxoExt for SpaceOut {
+    fn public_key(&self) -> Option<XOnlyPublicKey> {
+        match self.script_pubkey.is_p2tr() {
+            true => XOnlyPublicKey::from_slice(&self.script_pubkey.as_bytes()[2..]).ok(),
+            false => None,
+        }
+    }
+}
+
+impl UtxoExt for PtrOut {
     fn public_key(&self) -> Option<XOnlyPublicKey> {
         match self.script_pubkey.is_p2tr() {
             true => XOnlyPublicKey::from_slice(&self.script_pubkey.as_bytes()[2..]).ok(),
@@ -175,24 +267,64 @@ impl Iterator for ProofIter<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(|(k, v)| {
-            if OutpointKey::is_valid(k) {
-                let result = bincode::decode_from_slice(v.as_slice(), config::standard())
-                    .ok()
-                    .map(|(raw, _)| Value::UTXO(raw));
+            match self.proof_type {
+                ProofType::Spaces => {
+                    // Spaces proof: OutpointKey → SpaceOut, SpaceKey → OutPoint
+                    if OutpointKey::is_valid(k) {
+                        let result = bincode::decode_from_slice(v.as_slice(), config::standard())
+                            .ok()
+                            .map(|(raw, _)| Value::UTXO(raw));
+                        return (*k, result.unwrap_or(Value::Unknown(v.clone())));
+                    }
+                    if SpaceKey::is_valid(k) {
+                        let result: Option<OutPoint> =
+                            bincode::serde::decode_from_slice(v.as_slice(), config::standard())
+                                .ok()
+                                .map(|(raw, _)| raw);
+                        return result
+                            .map(|r| (*k, Value::Outpoint(r)))
+                            .unwrap_or_else(|| (*k, Value::Unknown(v.clone())));
+                    }
+                    (*k, Value::Unknown(v.clone()))
+                }
+                ProofType::Ptrs => {
+                    // PTR proof: Try to decode value as different PTR types
 
-                return (*k, result.unwrap_or(Value::Unknown(v.clone())));
-            }
-            if SpaceKey::is_valid(k) {
-                let result: Option<OutPoint> =
-                    bincode::serde::decode_from_slice(v.as_slice(), config::standard())
-                        .ok()
-                        .map(|(raw, _)| raw);
-                return result
-                    .map(|r| (*k, Value::Outpoint(r)))
-                    .unwrap_or_else(|| (*k, Value::Unknown(v.clone())));
-            }
+                    // Try PtrOutpointKey → PtrOut
+                    let ptrout_result: Result<(PtrOut, _), _> = bincode::decode_from_slice(v.as_slice(), config::standard());
+                    if let Ok((ptrout, _)) = ptrout_result {
+                        return (*k, Value::PtrUTXO(ptrout));
+                    }
 
-            (*k, Value::Unknown(v.clone()))
+                    // Try Sptr → OutPoint
+                    let outpoint_result: Result<(OutPoint, _), _> = bincode::serde::decode_from_slice(v.as_slice(), config::standard());
+                    if let Ok((outpoint, _)) = outpoint_result {
+                        return (*k, Value::Outpoint(outpoint));
+                    }
+
+                    // Try CommitmentKey → Commitment
+                    let commitment_result: Result<(Commitment, _), _> = bincode::decode_from_slice(v.as_slice(), config::standard());
+                    if let Ok((commitment, _)) = commitment_result {
+                        return (*k, Value::Commitment(commitment));
+                    }
+
+                    // Try RegistrySptrKey → SLabel
+                    let space_result: Result<(SLabel, _), _> = bincode::decode_from_slice(v.as_slice(), config::standard());
+                    if let Ok((space, _)) = space_result {
+                        return (*k, Value::Space(space));
+                    }
+
+                    // Try RegistryKey → Hash (root)
+                    if v.len() == 32 {
+                        let root_result: Result<(hasher::Hash, _), _> = bincode::decode_from_slice(v.as_slice(), config::standard());
+                        if let Ok((root, _)) = root_result {
+                            return (*k, Value::Root(root));
+                        }
+                    }
+
+                    (*k, Value::Unknown(v.clone()))
+                }
+            }
         })
     }
 }
