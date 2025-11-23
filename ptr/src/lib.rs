@@ -104,6 +104,7 @@ pub struct PtrOut {
 pub struct Ptr {
     pub id: Sptr,
     pub data: Option<Vec<u8>>,
+    pub last_update: u32,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -499,7 +500,7 @@ impl Validator {
             }
             // Process spend
             changeset.spends.push(input_ctx.n);
-            self.process_spend(tx, input_ctx.n, input_ctx.ptrout, &new_space_utxos, &mut changeset);
+            self.process_spend(tx, input_ctx.n, input_ctx.ptrout, &new_space_utxos, &mut changeset, height);
         }
 
         // Process new PTR outputs
@@ -523,6 +524,7 @@ impl Validator {
                 sptr: Some(Ptr {
                     id: Sptr::from_spk::<H>(output.script_pubkey.clone()),
                     data: None,
+                    last_update: height,
                 }),
                 value: output.value,
                 script_pubkey: output.script_pubkey.clone(),
@@ -539,8 +541,9 @@ impl Validator {
         mut ptrout: PtrOut,
         new_space_utxos: &Vec<SpaceOut>,
         changeset: &mut TxChangeSet,
+        height: u32,
     ) {
-        let ptr = match ptrout.sptr {
+        let mut ptr = match ptrout.sptr {
             None => return,
             Some(ptr) => ptr,
         };
@@ -566,6 +569,7 @@ impl Validator {
             return;
         }
 
+        ptr.last_update = height;
         ptrout.n = output_index;
         ptrout.value = output.value;
         ptrout.script_pubkey = output.script_pubkey.clone();

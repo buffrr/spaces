@@ -207,6 +207,21 @@ pub enum ChainStateCommand {
         space_or_hash: String,
         resp: Responder<anyhow::Result<ProofResult>>,
     },
+    ProvePtrout {
+        outpoint: OutPoint,
+        prefer_recent: bool,
+        resp: Responder<anyhow::Result<ProofResult>>,
+    },
+    ProvePtrOutpoint {
+        sptr: Sptr,
+        resp: Responder<anyhow::Result<ProofResult>>,
+    },
+    ProveCommitment {
+        space: SLabel,
+        root: Hash,
+        prefer_recent: bool,
+        resp: Responder<anyhow::Result<ProofResult>>,
+    },
     GetRootAnchors {
         resp: Responder<anyhow::Result<Vec<RootAnchor>>>,
     },
@@ -380,6 +395,27 @@ pub trait Rpc {
     async fn prove_space_outpoint(
         &self,
         space_or_hash: &str,
+    ) -> Result<ProofResult, ErrorObjectOwned>;
+
+    #[method(name = "proveptrout")]
+    async fn prove_ptrout(
+        &self,
+        outpoint: OutPoint,
+        prefer_recent: Option<bool>,
+    ) -> Result<ProofResult, ErrorObjectOwned>;
+
+    #[method(name = "proveptroutpoint")]
+    async fn prove_ptr_outpoint(
+        &self,
+        sptr: Sptr,
+    ) -> Result<ProofResult, ErrorObjectOwned>;
+
+    #[method(name = "provecommitment")]
+    async fn prove_commitment(
+        &self,
+        space: SLabel,
+        root: sha256::Hash,
+        prefer_recent: Option<bool>,
     ) -> Result<ProofResult, ErrorObjectOwned>;
 
     #[method(name = "getrootanchors")]
@@ -1251,6 +1287,39 @@ impl RpcServer for RpcServerImpl {
             .map_err(|error| ErrorObjectOwned::owned(-1, error.to_string(), None::<String>))
     }
 
+    async fn prove_ptrout(
+        &self,
+        outpoint: OutPoint,
+        prefer_recent: Option<bool>,
+    ) -> Result<ProofResult, ErrorObjectOwned> {
+        self.store
+            .prove_ptrout(outpoint, prefer_recent.unwrap_or(false))
+            .await
+            .map_err(|error| ErrorObjectOwned::owned(-1, error.to_string(), None::<String>))
+    }
+
+    async fn prove_ptr_outpoint(
+        &self,
+        sptr: Sptr,
+    ) -> Result<ProofResult, ErrorObjectOwned> {
+        self.store
+            .prove_ptr_outpoint(sptr)
+            .await
+            .map_err(|error| ErrorObjectOwned::owned(-1, error.to_string(), None::<String>))
+    }
+
+    async fn prove_commitment(
+        &self,
+        space: SLabel,
+        root: sha256::Hash,
+        prefer_recent: Option<bool>,
+    ) -> Result<ProofResult, ErrorObjectOwned> {
+        self.store
+            .prove_commitment(space, *root.as_ref(), prefer_recent.unwrap_or(false))
+            .await
+            .map_err(|error| ErrorObjectOwned::owned(-1, error.to_string(), None::<String>))
+    }
+
     async fn get_root_anchors(&self) -> Result<Vec<RootAnchor>, ErrorObjectOwned> {
         self.store
             .get_root_anchors()
@@ -1588,6 +1657,39 @@ impl AsyncChainState {
                     &space_or_hash,
                 ));
             }
+            ChainStateCommand::ProvePtrout {
+                outpoint,
+                prefer_recent,
+                resp,
+            } => {
+                _ = resp.send(Self::handle_prove_ptrout(
+                    state,
+                    outpoint,
+                    prefer_recent,
+                ));
+            }
+            ChainStateCommand::ProvePtrOutpoint {
+                sptr,
+                resp,
+            } => {
+                _ = resp.send(Self::handle_prove_ptr_outpoint(
+                    state,
+                    sptr,
+                ));
+            }
+            ChainStateCommand::ProveCommitment {
+                space,
+                root,
+                prefer_recent,
+                resp,
+            } => {
+                _ = resp.send(Self::handle_prove_commitment(
+                    state,
+                    space,
+                    root,
+                    prefer_recent,
+                ));
+            }
             ChainStateCommand::GetRootAnchors { resp } => {
                 _ = resp.send(Self::handle_get_anchor(anchors_path, state));
             }
@@ -1726,6 +1828,112 @@ impl AsyncChainState {
         })
     }
 
+    fn handle_prove_ptr_outpoint(
+        state: &mut Chain,
+        sptr: Sptr,
+    ) -> anyhow::Result<ProofResult> {
+        let snapshot = state.ptrs_mut().state.inner()?;
+
+        // warm up hash cache
+        let root = snapshot.compute_root()?;
+        let proof = snapshot.prove(&[sptr.to_bytes().into()], ProofType::Standard)?;
+
+        let mut buf = vec![0u8; 4096];
+        let offset = proof.write_to_slice(&mut buf)?;
+        buf.truncate(offset);
+
+        Ok(ProofResult {
+            proof: buf,
+            root: Bytes::new(root.to_vec()),
+        })
+    }
+
+    fn handle_prove_ptrout(
+        state: &mut Chain,
+        outpoint: OutPoint,
+        prefer_recent: bool,
+    ) -> anyhow::Result<ProofResult> {
+        let key = OutpointKey::from_outpoint::<Sha256>(outpoint);
+
+        let proof = if !prefer_recent {
+            let ptrout = match state.get_ptrout(&outpoint)? {
+                Some(ptrout) => ptrout,
+                None => {
+                    return Err(anyhow!(
+                        "Cannot find older proofs for a non-existent utxo (try with prefer_recent: true)"
+                    ))
+                }
+            };
+
+            // Use the last_update height from the PTR to find an appropriate snapshot
+            let target_snapshot = match &ptrout.sptr {
+                Some(ptr) => {
+                    let tip = state.ptrs_tip();
+                    Self::compute_target_snapshot(ptr.last_update, tip.height)
+                }
+                None => {
+                    return Err(anyhow!(
+                        "Cannot find older proofs for a UTXO without PTR data (try with prefer_recent: true)"
+                    ))
+                }
+            };
+            state.prove_ptrs_with_snapshot(&[key.into()], target_snapshot)?
+        } else {
+            let snapshot = state.ptrs_mut().state.inner()?;
+            snapshot.prove(&[key.into()], ProofType::Standard)?
+        };
+
+        let root = proof.compute_root()?.to_vec();
+        info!("Proving PTR with root anchor {}", hex::encode(root.as_slice()));
+        let mut buf = vec![0u8; 4096];
+        let offset = proof.write_to_slice(&mut buf)?;
+        buf.truncate(offset);
+
+        Ok(ProofResult {
+            proof: buf,
+            root: Bytes::new(root),
+        })
+    }
+
+    fn handle_prove_commitment(
+        state: &mut Chain,
+        space: SLabel,
+        root: Hash,
+        prefer_recent: bool,
+    ) -> anyhow::Result<ProofResult> {
+        let key = CommitmentKey::new::<Sha256>(&space, root);
+
+        let proof = if !prefer_recent {
+            let commitment = match state.get_commitment(&key)? {
+                Some(commitment) => commitment,
+                None => {
+                    return Err(anyhow!(
+                        "Cannot find older proofs for a non-existent commitment (try with prefer_recent: true)"
+                    ))
+                }
+            };
+
+            // Use the block_height from the commitment to find an appropriate snapshot
+            let tip = state.ptrs_tip();
+            let target_snapshot = Self::compute_target_snapshot(commitment.block_height, tip.height);
+            state.prove_ptrs_with_snapshot(&[key.into()], target_snapshot)?
+        } else {
+            let snapshot = state.ptrs_mut().state.inner()?;
+            snapshot.prove(&[key.into()], ProofType::Standard)?
+        };
+
+        let root = proof.compute_root()?.to_vec();
+        info!("Proving commitment with root anchor {}", hex::encode(root.as_slice()));
+        let mut buf = vec![0u8; 4096];
+        let offset = proof.write_to_slice(&mut buf)?;
+        buf.truncate(offset);
+
+        Ok(ProofResult {
+            proof: buf,
+            root: Bytes::new(root),
+        })
+    }
+
     pub async fn handler(
         client: &reqwest::Client,
         rpc: BitcoinRpc,
@@ -1797,6 +2005,51 @@ impl AsyncChainState {
         self.sender
             .send(ChainStateCommand::ProveSpaceOutpoint {
                 space_or_hash: space_or_hash.to_string(),
+                resp,
+            })
+            .await?;
+        resp_rx.await?
+    }
+
+    pub async fn prove_ptrout(
+        &self,
+        outpoint: OutPoint,
+        prefer_recent: bool,
+    ) -> anyhow::Result<ProofResult> {
+        let (resp, resp_rx) = oneshot::channel();
+        self.sender
+            .send(ChainStateCommand::ProvePtrout {
+                outpoint,
+                prefer_recent,
+                resp,
+            })
+            .await?;
+        resp_rx.await?
+    }
+
+    pub async fn prove_ptr_outpoint(&self, sptr: Sptr) -> anyhow::Result<ProofResult> {
+        let (resp, resp_rx) = oneshot::channel();
+        self.sender
+            .send(ChainStateCommand::ProvePtrOutpoint {
+                sptr,
+                resp,
+            })
+            .await?;
+        resp_rx.await?
+    }
+
+    pub async fn prove_commitment(
+        &self,
+        space: SLabel,
+        root: Hash,
+        prefer_recent: bool,
+    ) -> anyhow::Result<ProofResult> {
+        let (resp, resp_rx) = oneshot::channel();
+        self.sender
+            .send(ChainStateCommand::ProveCommitment {
+                space,
+                root,
+                prefer_recent,
                 resp,
             })
             .await?;

@@ -336,6 +336,14 @@ impl Chain {
         self.db.sp.state.prove_with_snapshot(keys, snapshot_block_height)
     }
 
+    pub fn prove_ptrs_with_snapshot(
+        &self,
+        keys: &[Hash],
+        snapshot_block_height: u32,
+    ) -> anyhow::Result<SubTree<Sha256Hasher>> {
+        self.db.pt.state.prove_with_snapshot(keys, snapshot_block_height)
+    }
+
     pub fn get_spaces_block(&mut self, hash: BlockHash) -> anyhow::Result<Option<BlockMetaWithHash>> {
         let idx = match &mut self.idx.sp  {
             None => return Err(anyhow!("spaces index must be enabled")),
