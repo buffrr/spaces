@@ -10,7 +10,7 @@ use spaces_protocol::hasher::{BaseHash, BidKey, OutpointKey, SpaceKey};
 use spaces_protocol::prepare::SpacesSource;
 use spaces_protocol::{FullSpaceOut, SpaceOut};
 use spaces_protocol::slabel::SLabel;
-use spaces_ptr::{Commitment, CommitmentKey, FullPtrOut, PtrOut, PtrSource, RegistryKey, RegistrySptrKey};
+use spaces_ptr::{Commitment, CommitmentKey, FullPtrOut, PtrOut, PtrSource, RegistryKey, RegistrySptrKey, PtrOutpointKey};
 use spaces_ptr::sptr::Sptr;
 use spaces_wallet::bitcoin::Network;
 use crate::client::{BlockMeta, PtrBlockMeta};
@@ -276,7 +276,7 @@ impl Chain {
         tip.hash = block_hash;
     }
 
-    pub(crate) fn insert_ptrout(&self, key: OutpointKey, ptrout: PtrOut) {
+    pub(crate) fn insert_ptrout(&self, key: PtrOutpointKey, ptrout: PtrOut) {
         self.db.pt.state.insert(key, ptrout)
     }
 

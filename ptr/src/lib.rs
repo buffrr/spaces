@@ -143,6 +143,7 @@ pub enum KeyKind {
     Sptr = 0x02,
     Registry = 0x03,
     RegistrySptr = 0x04,
+    PtrOutpoint = 0x05,
 }
 
 impl KeyKind {
@@ -175,9 +176,15 @@ pub struct RegistrySptrKey([u8; 32]);
 #[cfg_attr(feature = "bincode", derive(Encode, Decode))]
 pub struct CommitmentKey([u8; 32]);
 
+#[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "bincode", derive(Encode, Decode))]
+pub struct PtrOutpointKey([u8; 32]);
+
 impl KeyHash for RegistryKey {}
 impl KeyHash for RegistrySptrKey {}
 impl KeyHash for CommitmentKey {}
+impl KeyHash for PtrOutpointKey {}
 
 impl Commitment {
     pub fn is_finalized(&self, height: u32) -> bool {
@@ -202,6 +209,21 @@ impl From<RegistrySptrKey> for Hash {
 impl From<CommitmentKey> for Hash {
     fn from(value: CommitmentKey) -> Self {
         value.0
+    }
+}
+
+impl From<PtrOutpointKey> for Hash {
+    fn from(value: PtrOutpointKey) -> Self {
+        value.0
+    }
+}
+
+impl PtrOutpointKey {
+    pub fn from_outpoint<H: KeyHasher>(outpoint: OutPoint) -> Self {
+        let mut buffer = [0u8; 36];
+        buffer[0..32].copy_from_slice(outpoint.txid.as_ref());
+        buffer[32..36].copy_from_slice(&outpoint.vout.to_le_bytes());
+        Self(ns_hash::<H>(KeyKind::PtrOutpoint, H::hash(&buffer)))
     }
 }
 

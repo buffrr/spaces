@@ -48,7 +48,7 @@ use tokio::{
     task::JoinSet,
 };
 use spaces_protocol::hasher::Hash;
-use spaces_ptr::{PtrSource, FullPtrOut, PtrOut, Commitment, RegistryKey, CommitmentKey, RegistrySptrKey};
+use spaces_ptr::{PtrSource, FullPtrOut, PtrOut, Commitment, RegistryKey, CommitmentKey, RegistrySptrKey, PtrOutpointKey};
 use spaces_ptr::sptr::Sptr;
 use spaces_wallet::bitcoin::hashes::sha256;
 use crate::auth::BasicAuthLayer;
@@ -1853,7 +1853,7 @@ impl AsyncChainState {
         outpoint: OutPoint,
         prefer_recent: bool,
     ) -> anyhow::Result<ProofResult> {
-        let key = OutpointKey::from_outpoint::<Sha256>(outpoint);
+        let key = PtrOutpointKey::from_outpoint::<Sha256>(outpoint);
 
         let proof = if !prefer_recent {
             let ptrout = match state.get_ptrout(&outpoint)? {

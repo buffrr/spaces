@@ -15,7 +15,7 @@ use spaces_protocol::{
     validate::{TxChangeSet, UpdateKind, Validator},
     Bytes, Covenant, FullSpaceOut, RevokeReason, SpaceOut,
 };
-use spaces_ptr::{CommitmentKey, RegistryKey, RegistrySptrKey};
+use spaces_ptr::{CommitmentKey, RegistryKey, RegistrySptrKey, PtrOutpointKey};
 use spaces_wallet::bitcoin::{Network, Transaction};
 
 use crate::{
@@ -348,7 +348,7 @@ impl Client {
             }
 
             // Outpoint => PtrOut
-            let outpoint_key = OutpointKey::from_outpoint::<Sha256>(outpoint);
+            let outpoint_key = PtrOutpointKey::from_outpoint::<Sha256>(outpoint);
             state.insert_ptrout(outpoint_key, create);
         }
     }
