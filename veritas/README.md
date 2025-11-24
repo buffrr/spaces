@@ -116,6 +116,10 @@ if (ptrout) {
     if (ptr) {
         console.log('📍 SPTR ID: ', ptr.getId().toString());
         console.log('📅 Last update: ', ptr.getLastUpdate());
+        const data = ptr.getData();
+        if (data) {
+            console.log('📦 Data: ', Buffer.from(data).toString('utf-8'));
+        }
     }
 }
 

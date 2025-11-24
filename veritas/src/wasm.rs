@@ -312,6 +312,11 @@ mod wasm_api {
         pub fn get_last_update(&self) -> u32 {
             self.inner.last_update
         }
+
+        #[wasm_bindgen(js_name = "getData")]
+        pub fn get_data(&self) -> Option<Vec<u8>> {
+            self.inner.data.clone()
+        }
     }
 
     #[wasm_bindgen]
@@ -326,7 +331,7 @@ mod wasm_api {
 
         #[wasm_bindgen(js_name = "getRoot")]
         pub fn get_root(&self) -> Vec<u8> {
-            self.inner.root.to_vec()
+            self.inner.state_root.to_vec()
         }
 
         #[wasm_bindgen(js_name = "getBlockHeight")]

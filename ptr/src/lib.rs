@@ -420,7 +420,12 @@ impl Validator {
             new_delegations: vec![],
         };
 
-        let commitment_op = parse_commitment_ops(&tx);
+        let ptr_op = parse_ptr_op(&tx);
+        let (commitment_op, data_op) = match &ptr_op {
+            Some(PtrOp::Commitment(c)) => (Some(c), None),
+            Some(PtrOp::Data(d)) => (None, Some(d.clone())),
+            None => (None, None),
+        };
 
         // Remove sptr -> space mappings if a space is spent
         changeset.revoked_delegations = spent_space_utxos
@@ -436,7 +441,7 @@ impl Validator {
             })
             .collect();
 
-        // Allow revoked sptrs to be redefined
+        // Allow sptrs to be redelegated
         let revoked_keys: Vec<RegistrySptrKey> = changeset.revoked_delegations
             .iter()
             .map(|rd| RegistrySptrKey::from_sptr::<H>(rd.sptr))
@@ -522,7 +527,7 @@ impl Validator {
             }
             // Process spend
             changeset.spends.push(input_ctx.n);
-            self.process_spend(tx, input_ctx.n, input_ctx.ptrout, &new_space_utxos, &mut changeset, height);
+            self.process_spend(tx, input_ctx.n, input_ctx.ptrout, &new_space_utxos, &mut changeset, height, &data_op);
         }
 
         // Process new PTR outputs
@@ -545,7 +550,7 @@ impl Validator {
                 n,
                 sptr: Some(Ptr {
                     id: Sptr::from_spk::<H>(output.script_pubkey.clone()),
-                    data: None,
+                    data: data_op.clone(),
                     last_update: height,
                 }),
                 value: output.value,
@@ -564,6 +569,7 @@ impl Validator {
         new_space_utxos: &Vec<SpaceOut>,
         changeset: &mut TxChangeSet,
         height: u32,
+        data: &Option<Vec<u8>>,
     ) {
         let mut ptr = match ptrout.sptr {
             None => return,
@@ -592,12 +598,27 @@ impl Validator {
         }
 
         ptr.last_update = height;
+        // Only update data if:
+        // 1. A data OP_RETURN is present
+        // 2. PTR is P2TR and input uses SIGHASH_ALL (prevents malicious data injection)
+        if let Some(new_data) = data {
+            if ptrout.script_pubkey.is_p2tr() && is_p2tr_sighash_all(tx, input_index) {
+                ptr.data = Some(new_data.clone());
+            }
+        }
         ptrout.n = output_index;
         ptrout.value = output.value;
         ptrout.script_pubkey = output.script_pubkey.clone();
         ptrout.sptr = Some(ptr);
         changeset.creates.push(ptrout);
     }
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtrOpType {
+    Commitment = 0x01,
+    Data = 0x02,
 }
 
 pub enum CommitmentOp {
@@ -607,7 +628,12 @@ pub enum CommitmentOp {
     Rollback,
 }
 
-pub fn parse_commitment_ops(tx: &Transaction) -> Option<CommitmentOp> {
+pub enum PtrOp {
+    Commitment(CommitmentOp),
+    Data(Vec<u8>),
+}
+
+pub fn parse_ptr_op(tx: &Transaction) -> Option<PtrOp> {
     let txout = tx.output.iter().find(|o| o.script_pubkey.is_op_return())?;
     let script = txout.script_pubkey.clone();
 
@@ -619,37 +645,50 @@ pub fn parse_commitment_ops(tx: &Transaction) -> Option<CommitmentOp> {
         _ => return None,
     }
 
-    // Second instruction must be push bytes with our marker
+    // Second instruction contains the marker and payload
     match instructions.next()?.ok()? {
         Instruction::PushBytes(bytes) => {
-            // Check marker
-            if bytes.is_empty() || bytes[0] != 0x77 {
+            if bytes.is_empty() {
                 return None;
             }
 
-            // Rollback: just the marker byte
-            if bytes.len() == 1 {
-                return Some(CommitmentOp::Rollback);
-            }
+            match bytes[0] {
+                x if x == PtrOpType::Commitment as u8 => {
+                    // Rollback: just the marker byte
+                    if bytes.len() == 1 {
+                        return Some(PtrOp::Commitment(CommitmentOp::Rollback));
+                    }
 
-            // Commitments: marker + N * 32 bytes
-            let payload = &bytes[1..];
-            if payload.len() % 32 != 0 {
-                return None;
-            }
+                    // Commitments: marker + N * 32 bytes
+                    let payload = &bytes[1..];
+                    if payload.len() % 32 != 0 {
+                        return None;
+                    }
 
-            let mut commitments = Vec::with_capacity(payload.len() / 32);
-            for chunk in payload.as_bytes().chunks_exact(32) {
-                let mut commitment = [0u8; 32];
-                commitment.copy_from_slice(chunk);
-                commitments.push(commitment);
-            }
+                    let mut commitments = Vec::with_capacity(payload.len() / 32);
+                    for chunk in payload.as_bytes().chunks_exact(32) {
+                        let mut commitment = [0u8; 32];
+                        commitment.copy_from_slice(chunk);
+                        commitments.push(commitment);
+                    }
 
-            if commitments.is_empty() {
-                return None;
-            }
+                    if commitments.is_empty() {
+                        return None;
+                    }
 
-            Some(CommitmentOp::Commit(commitments))
+                    Some(PtrOp::Commitment(CommitmentOp::Commit(commitments)))
+                }
+                x if x == PtrOpType::Data as u8 => {
+                    // Data: marker + payload
+                    let payload = &bytes[1..];
+                    if payload.is_empty() {
+                        return None;
+                    }
+
+                    Some(PtrOp::Data(payload.as_bytes().to_vec()))
+                }
+                _ => None,
+            }
         }
         _ => None,
     }
@@ -662,13 +701,13 @@ pub fn create_commitment_script(op: &CommitmentOp) -> ScriptBuf {
 
     match op {
         CommitmentOp::Rollback => {
-            // OP_RETURN OP_PUSHBYTES_1 0x77
-            builder = builder.push_slice(&[0x77]);
+            // OP_RETURN OP_PUSHBYTES_1 0x01
+            builder = builder.push_slice(&[PtrOpType::Commitment as u8]);
         }
         CommitmentOp::Commit(commitments) => {
-            // OP_RETURN OP_PUSHBYTES_N 0x77 [commitments...]
+            // OP_RETURN OP_PUSHBYTES_N 0x01 [commitments...]
             let mut buf = PushBytesBuf::new();
-            buf.push(0x77).expect("valid");
+            buf.push(PtrOpType::Commitment as u8).expect("valid");
             for commitment in commitments {
                 buf.extend_from_slice(commitment).expect("");
             }
@@ -679,6 +718,44 @@ pub fn create_commitment_script(op: &CommitmentOp) -> ScriptBuf {
     builder.into_script()
 }
 
+/// Create data OP_RETURN script for PTR transfers
+/// Format: OP_RETURN 0x02 [data]
+pub fn create_data_script(data: &[u8]) -> ScriptBuf {
+    let mut buf = PushBytesBuf::new();
+    buf.push(PtrOpType::Data as u8).expect("valid");
+    buf.extend_from_slice(data).expect("valid");
+
+    ScriptBuf::builder()
+        .push_opcode(OP_RETURN)
+        .push_slice(buf)
+        .into_script()
+}
+
+/// Check if an input uses SIGHASH_ALL for a P2TR key path spend
+/// Per BIP 341:
+/// - 64 bytes = SIGHASH_DEFAULT (0x00), equivalent to SIGHASH_ALL
+/// - 65 bytes with last byte 0x01 = SIGHASH_ALL
+/// Note: 0x00 is never appended (always 64 bytes for default)
+fn is_p2tr_sighash_all(tx: &Transaction, input_index: usize) -> bool {
+    let input = match tx.input.get(input_index) {
+        Some(input) => input,
+        None => return false,
+    };
+
+    let witness = &input.witness;
+    if witness.is_empty() {
+        return false;
+    }
+
+    // First witness element is the schnorr signature for P2TR key path
+    let sig = &witness[0];
+
+    match sig.len() {
+        64 => true, // SIGHASH_DEFAULT (0x00) - equivalent to SIGHASH_ALL
+        65 => sig[64] == 0x01, // SIGHASH_ALL (0x01)
+        _ => false,
+    }
+}
 
 pub fn is_ptr_minting_locktime(lock_time: &LockTime) -> bool {
     if let LockTime::Seconds(s) = lock_time {
