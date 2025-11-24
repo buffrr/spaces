@@ -268,6 +268,10 @@ impl SpacesWallet {
         self.internal.next_unused_address(keychain_kind)
     }
 
+    pub fn reveal_next_address(&mut self, keychain_kind: KeychainKind) -> AddressInfo {
+        self.internal.reveal_next_address(keychain_kind)
+    }
+
     pub fn local_chain(&self) -> &LocalChain {
         self.internal.local_chain()
     }
@@ -601,6 +605,11 @@ impl SpacesWallet {
 
     pub fn next_unused_space_address(&mut self) -> SpaceAddress {
         let info = self.internal.next_unused_address(KeychainKind::External);
+        SpaceAddress(info.address)
+    }
+
+    pub fn reveal_next_space_address(&mut self) -> SpaceAddress {
+        let info = self.reveal_next_address(KeychainKind::External);
         SpaceAddress(info.address)
     }
 

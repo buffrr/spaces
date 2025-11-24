@@ -20,10 +20,10 @@ use spacedb::{
 use spaces_protocol::{
     bitcoin::{BlockHash, OutPoint},
     constants::{ChainAnchor},
-    hasher::{KeyHash, OutpointKey},
+    hasher::{KeyHash},
 };
 use spaces_protocol::slabel::SLabel;
-use spaces_ptr::{Commitment, CommitmentKey, FullPtrOut, PtrOut, PtrSource, RegistryKey, RegistrySptrKey};
+use spaces_ptr::{Commitment, CommitmentKey, FullPtrOut, PtrOut, PtrSource, RegistryKey, RegistrySptrKey, PtrOutpointKey};
 use spaces_ptr::sptr::Sptr;
 use crate::store::{EncodableOutpoint, Sha256};
 
@@ -110,7 +110,7 @@ impl PtrStore {
 }
 
 pub trait PtrChainState {
-    fn insert_ptrout(&self, key: OutpointKey, ptrout: PtrOut);
+    fn insert_ptrout(&self, key: PtrOutpointKey, ptrout: PtrOut);
     fn insert_commitment(&self, key: CommitmentKey, commitment: Commitment);
     fn insert_registry(&self, key: RegistryKey, state_root: Hash);
     fn insert_registry_delegation(&self, key: RegistrySptrKey, space: SLabel);
@@ -124,8 +124,8 @@ pub trait PtrChainState {
 }
 
 impl PtrChainState for PtrLiveSnapshot {
-    fn insert_ptrout(&self, key: OutpointKey, spaceout: PtrOut) {
-        self.insert(key, spaceout)
+    fn insert_ptrout(&self, key: PtrOutpointKey, ptrout: PtrOut) {
+        self.insert(key, ptrout)
     }
 
     fn insert_commitment(&self, key: CommitmentKey, commitment: Commitment) {
@@ -351,7 +351,7 @@ impl PtrSource for PtrLiveSnapshot {
         &mut self,
         outpoint: &OutPoint,
     ) -> spaces_protocol::errors::Result<Option<PtrOut>> {
-        let h = OutpointKey::from_outpoint::<Sha256>(*outpoint);
+        let h = PtrOutpointKey::from_outpoint::<Sha256>(*outpoint);
         let result = self.get(h).map_err(|err| {
             spaces_protocol::errors::Error::IO(format!("getptrout: {}", err.to_string()))
         })?;

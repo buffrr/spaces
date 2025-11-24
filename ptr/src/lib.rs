@@ -2,7 +2,6 @@
 pub mod sptr;
 pub mod constants;
 
-use std::collections::BTreeMap;
 #[cfg(feature = "bincode")]
 use bincode::{Decode, Encode};
 
@@ -11,10 +10,12 @@ use serde::{Deserialize, Serialize};
 
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use bitcoin::absolute::LockTime;
-use bitcoin::opcodes::all::{OP_PUSHBYTES_33, OP_RETURN};
+use bitcoin::opcodes::all::{OP_RETURN};
+use bitcoin::script::{Instruction, PushBytesBuf};
 use spaces_protocol::hasher::{KeyHasher, KeyHash, Hash};
 use spaces_protocol::slabel::SLabel;
 use spaces_protocol::{SpaceOut};
+use crate::constants::COMMITMENT_FINALITY_INTERVAL;
 use crate::sptr::{Sptr};
 
 
@@ -44,20 +45,28 @@ pub struct TxChangeSet {
     pub spends: Vec<usize>,
     /// List of transaction outputs creating a ptrout.
     pub creates: Vec<PtrOut>,
-    /// Any updates to existing ptrs mainly to remove a delegation
-    pub updates: Vec<FullPtrOut>,
     /// New commitments made
-    pub commitments: BTreeMap<SLabel, Commitment>,
-    pub revoked_delegations: Vec<RegistrySptrKey>,
-    pub new_delegations: Vec<Delegation>,
+    pub commitments: Vec<CommitmentInfo>,
+    pub revoked_commitments: Vec<CommitmentInfo>,
+    pub revoked_delegations: Vec<DelegationInfo>,
+    pub new_delegations: Vec<DelegationInfo>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "bincode", derive(Encode, Decode))]
-pub struct Delegation {
+pub struct CommitmentInfo {
     pub space: SLabel,
-    pub sptr_key: RegistrySptrKey,
+    #[cfg_attr(feature = "serde", serde(flatten))]
+    pub commitment: Commitment,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "bincode", derive(Encode, Decode))]
+pub struct DelegationInfo {
+    pub space: SLabel,
+    pub sptr: Sptr,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -93,8 +102,9 @@ pub struct PtrOut {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "bincode", derive(Encode, Decode))]
 pub struct Ptr {
-    pub genesis_spk: Vec<u8>,
+    pub id: Sptr,
     pub data: Option<Vec<u8>>,
+    pub last_update: u32,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -102,12 +112,24 @@ pub struct Ptr {
 #[cfg_attr(feature = "bincode", derive(Encode, Decode))]
 pub struct Commitment {
     /// Merkle/Trie commitment to the current state.
+    #[cfg_attr(feature = "serde", serde(
+        serialize_with = "serialize_hash_serde",
+        deserialize_with = "deserialize_hash_serde"
+    ))]
     pub state_root: [u8; 32],
 
     /// Previous state root (None for genesis).
+    #[cfg_attr(feature = "serde", serde(
+        serialize_with = "serialize_optional_hash_serde",
+        deserialize_with = "deserialize_optional_hash_serde"
+    ))]
     pub prev_root: Option<[u8; 32]>,
 
     /// Running history hash
+    #[cfg_attr(feature = "serde", serde(
+        serialize_with = "serialize_hash_serde",
+        deserialize_with = "deserialize_hash_serde"
+    ))]
     pub history_hash: [u8; 32],
 
     /// Block height at which the commitment was made
@@ -121,6 +143,7 @@ pub enum KeyKind {
     Sptr = 0x02,
     Registry = 0x03,
     RegistrySptr = 0x04,
+    PtrOutpoint = 0x05,
 }
 
 impl KeyKind {
@@ -138,7 +161,7 @@ pub fn ns_hash<H: KeyHasher>(kind: KeyKind, data: [u8; 32]) -> [u8; 32] {
 }
 
 
-#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "bincode", derive(Encode, Decode))]
 pub struct RegistryKey([u8; 32]);
@@ -148,14 +171,28 @@ pub struct RegistryKey([u8; 32]);
 #[cfg_attr(feature = "bincode", derive(Encode, Decode))]
 pub struct RegistrySptrKey([u8; 32]);
 
-#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "bincode", derive(Encode, Decode))]
 pub struct CommitmentKey([u8; 32]);
 
+#[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "bincode", derive(Encode, Decode))]
+pub struct PtrOutpointKey([u8; 32]);
+
 impl KeyHash for RegistryKey {}
 impl KeyHash for RegistrySptrKey {}
 impl KeyHash for CommitmentKey {}
+impl KeyHash for PtrOutpointKey {}
+
+impl Commitment {
+    pub fn is_finalized(&self, height: u32) -> bool {
+        let finality_height = self.block_height + COMMITMENT_FINALITY_INTERVAL;
+        height > finality_height
+    }
+}
+
 
 impl From<RegistryKey> for Hash {
     fn from(value: RegistryKey) -> Self {
@@ -175,9 +212,24 @@ impl From<CommitmentKey> for Hash {
     }
 }
 
+impl From<PtrOutpointKey> for Hash {
+    fn from(value: PtrOutpointKey) -> Self {
+        value.0
+    }
+}
+
+impl PtrOutpointKey {
+    pub fn from_outpoint<H: KeyHasher>(outpoint: OutPoint) -> Self {
+        let mut buffer = [0u8; 36];
+        buffer[0..32].copy_from_slice(outpoint.txid.as_ref());
+        buffer[32..36].copy_from_slice(&outpoint.vout.to_le_bytes());
+        Self(ns_hash::<H>(KeyKind::PtrOutpoint, H::hash(&buffer)))
+    }
+}
+
 impl CommitmentKey {
-    pub fn new<H: KeyHasher>(space: &SLabel, root: [u8;32]) -> Self {
-        let mut data = [0u8;64];
+    pub fn new<H: KeyHasher>(space: &SLabel, root: [u8; 32]) -> Self {
+        let mut data = [0u8; 64];
         data[0..32].copy_from_slice(&H::hash(space.as_ref()));
         data[32..64].copy_from_slice(&root);
         Self(ns_hash::<H>(KeyKind::Registry, H::hash(&data)))
@@ -197,12 +249,6 @@ impl RegistrySptrKey {
     }
 }
 
-impl Commitment {
-    pub fn key<H: KeyHasher>(&self) -> [u8; 32] {
-        ns_hash::<H>(KeyKind::Commitment, self.state_root)
-    }
-}
-
 #[derive(Clone)]
 pub struct Stxo {
     pub n: usize,
@@ -213,12 +259,15 @@ pub struct Stxo {
 #[derive(Clone)]
 pub struct DelegateContext {
     space: SLabel,
-    previous_commitment: Option<Commitment>,
+    pending_tip: Option<Commitment>,
+    finalized_tip: Option<Commitment>,
 }
 
 pub struct TxContext {
     pub inputs: Vec<Stxo>,
-    pub relevant_sptr_spks: Vec<ScriptBuf>
+    pub relevant_sptr_spks: Vec<ScriptBuf>,
+    // sptrs with existing delegations cannot be used multiple times
+    pub sptrs_with_delegations: Vec<RegistrySptrKey>,
 }
 
 impl TxContext {
@@ -239,75 +288,106 @@ impl TxContext {
     pub fn from_tx<T: PtrSource, H: KeyHasher>(
         src: &mut T,
         tx: &Transaction,
-        has_spaces: bool,
+        spends_spaces: bool,
+        space_outputs: Vec<SpaceOut>,
+        height: u32,
     ) -> spaces_protocol::errors::Result<Option<TxContext>> {
         let has_ptr_outputs = is_ptr_minting_locktime(&tx.lock_time) &&
             tx.output.iter().any(|out| out.is_ptr_output());
-        let relevant = has_spaces || has_ptr_outputs ||
-            Self::spending_ptrs(src, &tx)?;
+        let has_spaces = spends_spaces || space_outputs.len() > 0;
+
+        let relevant = has_spaces || has_ptr_outputs || Self::spending_ptrs(src, tx)?;
 
         if !relevant {
             return Ok(None);
         }
 
         let mut inputs = Vec::with_capacity(tx.input.len());
+
         for (n, input) in tx.input.iter().enumerate() {
             let ptrout = src.get_ptrout(&input.previous_output)?;
+
             if let Some(ptrout) = ptrout {
                 let delegate = match &ptrout.sptr {
                     Some(sptr) => {
-                        // TODO: how about just storing the sptr itself in sptr.spk?
-                        let rsk = RegistrySptrKey::from_sptr::<H>(
-                            Sptr::from_spk::<H>(ScriptBuf::from(sptr.genesis_spk.clone()))
-                        );
-                        let slabel = src.get_delegator(&rsk)?;
-                        if let Some(slabel) = slabel {
-                            let registry_key = RegistryKey::from_slabel::<H>(&slabel);
-                            let state_root = src.get_commitments_tip(&registry_key)?;
-                            let ck = match state_root {
-                                Some(state_root) => {
-                                    let ck = CommitmentKey::new::<H>(&slabel, state_root);
-                                    src.get_commitment(&ck)?
-                                },
-                                None => None,
-                            };
+                        let rsk = RegistrySptrKey::from_sptr::<H>(sptr.id);
 
-                            Some(DelegateContext {
-                                space: slabel,
-                                previous_commitment: ck,
-                            })
-                        } else {
-                            None
+                        match src.get_delegator(&rsk)? {
+                            Some(slabel) => {
+                                let registry_key = RegistryKey::from_slabel::<H>(&slabel);
+                                let tip_root = src.get_commitments_tip(&registry_key)?;
+                                let tip = match tip_root {
+                                    Some(root) => {
+                                        let ck = CommitmentKey::new::<H>(&slabel, root);
+                                        src.get_commitment(&ck)?
+                                    }
+                                    None => None,
+                                };
+
+                                // Determine pending and finalized tips
+                                let (pending_tip, finalized_tip) = match tip {
+                                    Some(t) if t.is_finalized(height) => {
+                                        (None, Some(t))
+                                    }
+                                    Some(t) => {
+                                        // Tip is pending, check for previous finalized commitment
+                                        let finalized = match t.prev_root {
+                                            Some(prev_root) => {
+                                                let ck = CommitmentKey::new::<H>(&slabel, prev_root);
+                                                src.get_commitment(&ck)?
+                                            }
+                                            None => None,
+                                        };
+                                        (Some(t), finalized)
+                                    }
+                                    None => (None, None),
+                                };
+
+                                Some(DelegateContext {
+                                    space: slabel,
+                                    pending_tip,
+                                    finalized_tip,
+                                })
+                            }
+                            None => None,
                         }
                     }
                     None => None,
                 };
-                let ptrin = Stxo {
+
+                inputs.push(Stxo {
                     n,
                     ptrout,
                     delegate,
-                };
-                inputs.push(ptrin);
+                });
             }
         }
 
-        // for existence checks we need to find any previous sptrs from outputs
-        // TODO: technically we could fetch less by checking transfers
-        let mut ctx = TxContext {
+        let mut sptrs_with_delegations = Vec::with_capacity(space_outputs.len());
+        for spaceout in space_outputs {
+            let rsk = RegistrySptrKey::from_sptr::<H>(Sptr::from_spk::<H>(spaceout.script_pubkey));
+            if src.get_delegator(&rsk)?.is_some() {
+                sptrs_with_delegations.push(rsk);
+            }
+        }
+
+        // Build relevant SPTR script pubkeys for existence checks
+        let relevant_sptr_spks = tx.output
+            .iter()
+            .filter(|out| out.is_ptr_output())
+            .filter_map(|out| {
+                let sptr = Sptr::from_spk::<H>(out.script_pubkey.clone());
+                src.get_ptr_outpoint(&sptr)
+                    .ok()?
+                    .map(|_| out.script_pubkey.clone())
+            })
+            .collect();
+
+        Ok(Some(TxContext {
             inputs,
-            relevant_sptr_spks: Vec::with_capacity(tx.output.len()),
-        };
-        for out in tx.output.iter() {
-            if !out.is_ptr_output() {
-                continue;
-            }
-            let sptr = Sptr::from_spk::<H>(out.script_pubkey.clone());
-            if src.get_ptr_outpoint(&sptr)?.is_some() {
-                ctx.relevant_sptr_spks.push(out.script_pubkey.clone());
-            }
-        }
-
-        Ok(Some(ctx))
+            relevant_sptr_spks,
+            sptrs_with_delegations
+        }))
     }
 }
 
@@ -326,7 +406,7 @@ impl Validator {
     pub fn process<H: KeyHasher>(
         &self, height: u32,
         tx: &Transaction,
-        ctx: TxContext,
+        mut ctx: TxContext,
         spent_space_utxos: Vec<SpaceOut>,
         new_space_utxos: Vec<SpaceOut>,
     ) -> TxChangeSet {
@@ -334,86 +414,144 @@ impl Validator {
             txid: tx.compute_txid(),
             spends: vec![],
             creates: vec![],
-            updates: vec![],
-            commitments: BTreeMap::new(),
+            commitments: vec![],
+            revoked_commitments: vec![],
             revoked_delegations: vec![],
             new_delegations: vec![],
         };
 
-        let mut commitment_root = get_commitment_root(&tx);
+        let ptr_op = parse_ptr_op(&tx);
+        let (commitment_op, data_op) = match &ptr_op {
+            Some(PtrOp::Commitment(c)) => (Some(c), None),
+            Some(PtrOp::Data(d)) => (None, Some(d.clone())),
+            None => (None, None),
+        };
 
-        // Maintain space -> sptr registry mappings
-        for spent in spent_space_utxos {
-            let sptr = Sptr::from_spk::<H>(spent.script_pubkey);
-            changeset.revoked_delegations.push(RegistrySptrKey::from_sptr::<H>(sptr));
-        }
-        for created in &new_space_utxos {
-            let space = match &created.space {
-                None => continue,
-                Some(space) => space
-            };
-            let sptr = Sptr::from_spk::<H>(created.script_pubkey.clone());
-            changeset.new_delegations.push(Delegation {
-                space: space.name.clone(),
-                sptr_key: RegistrySptrKey::from_sptr::<H>(sptr),
+        // Remove sptr -> space mappings if a space is spent
+        changeset.revoked_delegations = spent_space_utxos
+            .into_iter()
+            .filter_map(|spent| {
+                spent.space.as_ref().map(|space| {
+                    let sptr = Sptr::from_spk::<H>(spent.script_pubkey);
+                    DelegationInfo {
+                        space: space.name.clone(),
+                        sptr,
+                    }
+                })
             })
-        }
+            .collect();
+
+        // Allow sptrs to be redelegated
+        let revoked_keys: Vec<RegistrySptrKey> = changeset.revoked_delegations
+            .iter()
+            .map(|rd| RegistrySptrKey::from_sptr::<H>(rd.sptr))
+            .collect();
+        ctx.sptrs_with_delegations.retain(|rsk| !revoked_keys.contains(rsk));
+
+        // Process new delegations from created space UTXOs
+        changeset.new_delegations = new_space_utxos
+            .iter()
+            .filter_map(|created| {
+                let sptr = Sptr::from_spk::<H>(created.script_pubkey.clone());
+                let rsk = RegistrySptrKey::from_sptr::<H>(sptr);
+                if ctx.sptrs_with_delegations.contains(&rsk) {
+                    return None;
+                }
+                created.space.as_ref().map(|space| {
+                    DelegationInfo {
+                        space: space.name.clone(),
+                        sptr,
+                    }
+                })
+            })
+            .collect();
+
+        let mut commitment_roots = match &commitment_op {
+            Some(CommitmentOp::Commit(roots)) => roots.iter(),
+            _ => [].iter(), // Empty iterator for rollback or no-op
+        };
 
         for input_ctx in ctx.inputs.into_iter() {
+            // Handle delegate commitments (only first delegate gets commitment_root)
             if let Some(delegate) = input_ctx.delegate {
-                if let Some(commitment_root) = commitment_root.take() {
-                    let commitment = match delegate.previous_commitment {
-                        None => Commitment {
-                            state_root: commitment_root,
-                            history_hash: commitment_root,
-                            prev_root: None,
-                            block_height: height,
-                        },
-                        Some(prev) => {
-                            Commitment {
-                                state_root: commitment_root,
-                                history_hash: transcript_hash::<H>(prev.history_hash, commitment_root),
-                                prev_root: Some(prev.state_root),
-                                block_height: height,
+                match &commitment_op {
+                    Some(CommitmentOp::Rollback) => {
+                        // Rollback applies to ALL delegates with pending commitments
+                        if let Some(pending) = delegate.pending_tip {
+                            if !pending.is_finalized(height) {
+                                changeset.revoked_commitments.push(
+                                    CommitmentInfo {
+                                        space: delegate.space.clone(),
+                                        commitment: pending,
+                                    }
+                                );
                             }
                         }
-                    };
-                    changeset.commitments.insert(delegate.space, commitment);
+                    }
+                    Some(CommitmentOp::Commit(_)) => {
+                        if let Some(root) = commitment_roots.next() {
+                            let commitment = match delegate.finalized_tip {
+                                None => Commitment {
+                                    state_root: *root,
+                                    history_hash: *root,
+                                    prev_root: None,
+                                    block_height: height,
+                                },
+                                Some(prev) => {
+                                    assert!(prev.is_finalized(height), "expected a finalized tip");
+                                    Commitment {
+                                        state_root: *root,
+                                        history_hash: transcript_hash::<H>(prev.history_hash, *root),
+                                        prev_root: Some(prev.state_root),
+                                        block_height: height,
+                                    }
+                                }
+                            };
+                            // Revoke pending commitment
+                            if let Some(pending) = delegate.pending_tip {
+                                changeset.revoked_commitments.push(
+                                    CommitmentInfo {
+                                        space: delegate.space.clone(),
+                                        commitment: pending,
+                                    }
+                                );
+                            }
+                            changeset.commitments.push(CommitmentInfo {
+                                space: delegate.space,
+                                commitment,
+                            });
+                        }
+                    }
+                    None => {}
                 }
             }
-
+            // Process spend
             changeset.spends.push(input_ctx.n);
-            self.process_spend(
-                tx,
-                input_ctx.n,
-                input_ctx.ptrout,
-                &mut changeset,
-            );
+            self.process_spend(tx, input_ctx.n, input_ctx.ptrout, &new_space_utxos, &mut changeset, height, &data_op);
         }
 
-        if !is_ptr_minting_locktime(&tx.lock_time) {
-            return changeset;
-        }
-
+        // Process new PTR outputs
         for (n, output) in tx.output.iter().enumerate() {
-            let already_added = changeset.creates.iter().find(|x| x.n == n).is_some();
-            let is_space = new_space_utxos.iter().find(|x| x.n == n).is_some();
-            let is_ptr_out = output.is_ptr_output();
-            if already_added || is_space || !is_ptr_out {
+            // Skip if not a PTR output or already processed
+            if !output.is_ptr_output()
+                || changeset.creates.iter().any(|x| x.n == n)
+                || new_space_utxos.iter().any(|x| x.n == n) {
                 continue;
             }
 
-            let already_exists = ctx.relevant_sptr_spks.iter()
-                .find(|spk| output.script_pubkey.as_bytes() == spk.as_bytes()).is_some();
-            if already_exists {
+            // Skip if SPTR already exists
+            if ctx.relevant_sptr_spks
+                .iter()
+                .any(|spk| output.script_pubkey.as_bytes() == spk.as_bytes()) {
                 continue;
             }
 
             changeset.creates.push(PtrOut {
                 n,
                 sptr: Some(Ptr {
-                    genesis_spk: output.script_pubkey.to_bytes(),
-                    data: None,
+                    id: Sptr::from_spk::<H>(output.script_pubkey.clone()),
+                    data: data_op.clone(),
+                    last_update: height,
                 }),
                 value: output.value,
                 script_pubkey: output.script_pubkey.clone(),
@@ -428,52 +566,192 @@ impl Validator {
         tx: &Transaction,
         input_index: usize,
         mut ptrout: PtrOut,
+        new_space_utxos: &Vec<SpaceOut>,
         changeset: &mut TxChangeSet,
+        height: u32,
+        data: &Option<Vec<u8>>,
     ) {
-        let ptr = match ptrout.sptr {
+        let mut ptr = match ptrout.sptr {
             None => return,
             Some(ptr) => ptr,
         };
-        let output_index = input_index + 1;
-        let output = tx.output.get(output_index);
+        // if a corresponding output at the same index has the same value,
+        // that output becomes the PTR
+        let mut output_index = input_index;
+        let mut output = match tx.output.get(input_index) {
+            None => return, // cannot be rebound, if N doesn't exist, then we can skip n+1 rule check
+            Some(output) => output,
+        };
 
-        match output {
-            None => {
-                // TODO: No corresponding output found - could it be rebound?
-                return
-            }
-            Some(output) => {
-                ptrout.n = output_index;
-                ptrout.value = output.value;
-                ptrout.script_pubkey = output.script_pubkey.clone();
-                ptrout.sptr = Some(ptr);
-                changeset.creates.push(ptrout);
+        // if the values don't match, then we assume it's a trading tx - ptr should be at n+1
+        if output.value != ptrout.value {
+            output_index = input_index + 1;
+            output = match tx.output.get(output_index) {
+                None => return, // no rebounds
+                Some(output) => output
+            };
+        }
+
+        // if the output is already a space, then it can't be rebound
+        if new_space_utxos.iter().any(|s| s.n == output_index) {
+            return;
+        }
+
+        ptr.last_update = height;
+        // Only update data if:
+        // 1. A data OP_RETURN is present
+        // 2. PTR is P2TR and input uses SIGHASH_ALL (prevents malicious data injection)
+        if let Some(new_data) = data {
+            if ptrout.script_pubkey.is_p2tr() && is_p2tr_sighash_all(tx, input_index) {
+                ptr.data = Some(new_data.clone());
             }
         }
+        ptrout.n = output_index;
+        ptrout.value = output.value;
+        ptrout.script_pubkey = output.script_pubkey.clone();
+        ptrout.sptr = Some(ptr);
+        changeset.creates.push(ptrout);
     }
 }
 
-pub fn get_commitment_root(tx: &Transaction) -> Option<[u8; 32]> {
-    let txout = tx.output.first()?;
-    let script = txout.script_pubkey.to_bytes();
-
-    // Fixed length: 1 (OP_RETURN) + 1 (OP_PUSHBYTES_33) + 1 (marker) + 32 (data)
-    if script.len() != 35 {
-        return None;
-    }
-
-    if script[0] != OP_RETURN.to_u8() ||
-        script[1] != OP_PUSHBYTES_33.to_u8() ||
-        script[2] != 0x77 /* Marker */ {
-        return None;
-    }
-
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&script[3..]);
-    Some(out)
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtrOpType {
+    Commitment = 0x01,
+    Data = 0x02,
 }
 
+pub enum CommitmentOp {
+    /// Add one or more new commitments
+    Commit(Vec<[u8; 32]>),
+    /// Rollback the last finalized commitment
+    Rollback,
+}
 
+pub enum PtrOp {
+    Commitment(CommitmentOp),
+    Data(Vec<u8>),
+}
+
+pub fn parse_ptr_op(tx: &Transaction) -> Option<PtrOp> {
+    let txout = tx.output.iter().find(|o| o.script_pubkey.is_op_return())?;
+    let script = txout.script_pubkey.clone();
+
+    let mut instructions = script.instructions();
+
+    // First instruction must be OP_RETURN
+    match instructions.next()?.ok()? {
+        Instruction::Op(OP_RETURN) => {}
+        _ => return None,
+    }
+
+    // Second instruction contains the marker and payload
+    match instructions.next()?.ok()? {
+        Instruction::PushBytes(bytes) => {
+            if bytes.is_empty() {
+                return None;
+            }
+
+            match bytes[0] {
+                x if x == PtrOpType::Commitment as u8 => {
+                    // Rollback: just the marker byte
+                    if bytes.len() == 1 {
+                        return Some(PtrOp::Commitment(CommitmentOp::Rollback));
+                    }
+
+                    // Commitments: marker + N * 32 bytes
+                    let payload = &bytes[1..];
+                    if payload.len() % 32 != 0 {
+                        return None;
+                    }
+
+                    let mut commitments = Vec::with_capacity(payload.len() / 32);
+                    for chunk in payload.as_bytes().chunks_exact(32) {
+                        let mut commitment = [0u8; 32];
+                        commitment.copy_from_slice(chunk);
+                        commitments.push(commitment);
+                    }
+
+                    if commitments.is_empty() {
+                        return None;
+                    }
+
+                    Some(PtrOp::Commitment(CommitmentOp::Commit(commitments)))
+                }
+                x if x == PtrOpType::Data as u8 => {
+                    // Data: marker + payload (payload can be empty)
+                    let payload = &bytes[1..];
+                    Some(PtrOp::Data(payload.as_bytes().to_vec()))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+// Create commitment scripts
+pub fn create_commitment_script(op: &CommitmentOp) -> ScriptBuf {
+    let mut builder = ScriptBuf::builder()
+        .push_opcode(OP_RETURN);
+
+    match op {
+        CommitmentOp::Rollback => {
+            // OP_RETURN OP_PUSHBYTES_1 0x01
+            builder = builder.push_slice(&[PtrOpType::Commitment as u8]);
+        }
+        CommitmentOp::Commit(commitments) => {
+            // OP_RETURN OP_PUSHBYTES_N 0x01 [commitments...]
+            let mut buf = PushBytesBuf::new();
+            buf.push(PtrOpType::Commitment as u8).expect("valid");
+            for commitment in commitments {
+                buf.extend_from_slice(commitment).expect("");
+            }
+            builder = builder.push_slice(buf);
+        }
+    };
+
+    builder.into_script()
+}
+
+/// Create data OP_RETURN script for PTR transfers
+/// Format: OP_RETURN 0x02 [data]
+pub fn create_data_script(data: &[u8]) -> ScriptBuf {
+    let mut buf = PushBytesBuf::new();
+    buf.push(PtrOpType::Data as u8).expect("valid");
+    buf.extend_from_slice(data).expect("valid");
+
+    ScriptBuf::builder()
+        .push_opcode(OP_RETURN)
+        .push_slice(buf)
+        .into_script()
+}
+
+/// Check if an input uses SIGHASH_ALL for a P2TR key path spend
+/// Per BIP 341:
+/// - 64 bytes = SIGHASH_DEFAULT (0x00), equivalent to SIGHASH_ALL
+/// - 65 bytes with last byte 0x01 = SIGHASH_ALL
+/// Note: 0x00 is never appended (always 64 bytes for default)
+fn is_p2tr_sighash_all(tx: &Transaction, input_index: usize) -> bool {
+    let input = match tx.input.get(input_index) {
+        Some(input) => input,
+        None => return false,
+    };
+
+    let witness = &input.witness;
+    if witness.is_empty() {
+        return false;
+    }
+
+    // First witness element is the schnorr signature for P2TR key path
+    let sig = &witness[0];
+
+    match sig.len() {
+        64 => true, // SIGHASH_DEFAULT (0x00) - equivalent to SIGHASH_ALL
+        65 => sig[64] == 0x01, // SIGHASH_ALL (0x01)
+        _ => false,
+    }
+}
 
 pub fn is_ptr_minting_locktime(lock_time: &LockTime) -> bool {
     if let LockTime::Seconds(s) = lock_time {
@@ -491,4 +769,65 @@ impl PtrTrackableOutput for TxOut {
         self.value.to_sat() % 10 == 7
     }
 }
+
+#[cfg(feature = "serde")]
+mod serde_helpers {
+    use serde::{Deserializer, Serializer, Deserialize};
+
+    pub fn serialize_hash_serde<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&hex::encode(bytes))
+        } else {
+            serializer.serialize_bytes(bytes)
+        }
+    }
+
+    pub fn deserialize_hash_serde<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            let s = String::deserialize(deserializer)?;
+            let mut bytes = [0u8; 32];
+            hex::decode_to_slice(s, &mut bytes).map_err(serde::de::Error::custom)?;
+            Ok(bytes)
+        } else {
+            <[u8; 32]>::deserialize(deserializer)
+        }
+    }
+
+    pub fn serialize_optional_hash_serde<S>(
+        bytes: &Option<[u8; 32]>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match bytes {
+            Some(b) => serialize_hash_serde(b, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize_optional_hash_serde<'de, D>(
+        deserializer: D,
+    ) -> Result<Option<[u8; 32]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer)?
+            .map(|s| {
+                let mut bytes = [0u8; 32];
+                hex::decode_to_slice(s, &mut bytes).map_err(serde::de::Error::custom)?;
+                Ok(bytes)
+            })
+            .transpose()
+    }
+}
+
+#[cfg(feature = "serde")]
+use serde_helpers::*;
 

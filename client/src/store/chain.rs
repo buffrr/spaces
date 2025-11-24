@@ -10,11 +10,11 @@ use spaces_protocol::hasher::{BaseHash, BidKey, OutpointKey, SpaceKey};
 use spaces_protocol::prepare::SpacesSource;
 use spaces_protocol::{FullSpaceOut, SpaceOut};
 use spaces_protocol::slabel::SLabel;
-use spaces_ptr::{Commitment, CommitmentKey, FullPtrOut, PtrOut, PtrSource, RegistryKey, RegistrySptrKey};
+use spaces_ptr::{Commitment, CommitmentKey, FullPtrOut, PtrOut, PtrSource, RegistryKey, RegistrySptrKey, PtrOutpointKey};
 use spaces_ptr::sptr::Sptr;
 use spaces_wallet::bitcoin::Network;
 use crate::client::{BlockMeta, PtrBlockMeta};
-use crate::rpc::BlockMetaWithHash;
+use crate::rpc::{BlockMetaWithHash, PtrBlockMetaWithHash};
 use crate::store::{EncodableOutpoint, ReadTx, Sha256};
 use crate::store::ptrs::{PtrChainState, PtrLiveStore, PtrStore};
 use crate::store::spaces::{RolloutEntry, RolloutIterator, SpLiveStore, SpStore, SpStoreUtils, SpacesState};
@@ -276,7 +276,7 @@ impl Chain {
         tip.hash = block_hash;
     }
 
-    pub(crate) fn insert_ptrout(&self, key: OutpointKey, ptrout: PtrOut) {
+    pub(crate) fn insert_ptrout(&self, key: PtrOutpointKey, ptrout: PtrOut) {
         self.db.pt.state.insert(key, ptrout)
     }
 
@@ -286,6 +286,10 @@ impl Chain {
 
     pub(crate) fn insert_delegation(&self, key: RegistrySptrKey, space: SLabel) {
         self.db.pt.state.insert_registry_delegation(key, space)
+    }
+
+    pub fn remove_delegation(&mut self, delegation: RegistrySptrKey) {
+        self.db.pt.state.remove(delegation)
     }
 
     pub(crate) fn insert_commitment(&self, key: CommitmentKey, commitment: Commitment) {
@@ -301,8 +305,10 @@ impl Chain {
         self.db.pt.state.remove(key)
     }
 
-    pub fn remove_delegation(&mut self, delegation: RegistrySptrKey) {
-        self.db.pt.state.remove(delegation)
+
+
+    pub fn remove_commitment(&mut self, commitment: CommitmentKey) {
+        self.db.pt.state.remove(commitment)
     }
 
     pub fn remove_space_utxo(&mut self, outpoint: OutPoint) {
@@ -330,6 +336,14 @@ impl Chain {
         self.db.sp.state.prove_with_snapshot(keys, snapshot_block_height)
     }
 
+    pub fn prove_ptrs_with_snapshot(
+        &self,
+        keys: &[Hash],
+        snapshot_block_height: u32,
+    ) -> anyhow::Result<SubTree<Sha256Hasher>> {
+        self.db.pt.state.prove_with_snapshot(keys, snapshot_block_height)
+    }
+
     pub fn get_spaces_block(&mut self, hash: BlockHash) -> anyhow::Result<Option<BlockMetaWithHash>> {
         let idx = match &mut self.idx.sp  {
             None => return Err(anyhow!("spaces index must be enabled")),
@@ -339,6 +353,21 @@ impl Chain {
         let block = idx.state.get(key).context("could not retrieve block meta")?;
         Ok(block.map(|b| {
            BlockMetaWithHash {
+               hash,
+               block_meta: b,
+           }
+        }))
+    }
+
+    pub fn get_ptrs_block(&mut self, hash: BlockHash) -> anyhow::Result<Option<PtrBlockMetaWithHash>> {
+        let idx = match &mut self.idx.pt  {
+            None => return Err(anyhow!("ptrs index must be enabled")),
+            Some(idx) => idx
+        };
+        let key = BaseHash::from_slice(hash.as_ref());
+        let block = idx.state.get(key).context("could not retrieve ptr block meta")?;
+        Ok(block.map(|b| {
+           PtrBlockMetaWithHash {
                hash,
                block_meta: b,
            }
@@ -467,21 +496,75 @@ impl Chain {
     }
 
     pub fn update_anchors(&self, anchors_path: &Path) -> anyhow::Result<()> {
-        // TODO: merge ptrs anchor
+        use std::collections::HashMap;
+        use std::fs;
+        use std::io;
+        use crate::rpc::RootAnchor;
+
         info!("Updating root anchors ...");
-        let result = self
-            .db
-            .sp
-            .store
-            .update_anchors(anchors_path, ROOT_ANCHORS_COUNT)
-            .or_else(|e| Err(anyhow!("Could not update trust anchors: {}", e)))?;
-        if let Some(result) = result.first() {
-            info!(
-                "Latest root anchor {} (height: {})",
-                hex::encode(result.root),
-                result.block.height
-            )
+
+        // Load previous anchors from file
+        let previous: Vec<RootAnchor> = match fs::read(anchors_path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+
+        let prev_map: HashMap<(BlockHash, u32), RootAnchor> = previous
+            .into_iter()
+            .map(|anchor| ((anchor.block.hash, anchor.block.height), anchor))
+            .collect();
+
+        let mut anchors = Vec::new();
+        let sp_iter = self.db.sp.store.iter().take(ROOT_ANCHORS_COUNT as _);
+        let mut pt_iter = self.db.pt.store.iter();
+
+        for sp_snap in sp_iter {
+            let mut sp_snap = sp_snap?;
+            let anchor: ChainAnchor = sp_snap.metadata().try_into()?;
+
+            // Check if we can get PTR snapshot at the same height
+            let mut ptrs_root = None;
+            if let Some(pt_snap) = pt_iter.next() {
+                if let Ok(mut pt_snap) = pt_snap {
+                    let pt_anchor: ChainAnchor = pt_snap.metadata().try_into()?;
+                    // Only include PTR root if it matches the same block
+                    if pt_anchor.height == anchor.height && pt_anchor.hash == anchor.hash {
+                        ptrs_root = Some(pt_snap.compute_root()?);
+                    }
+                }
+            }
+
+            if let Some(existing) = prev_map.get(&(anchor.hash, anchor.height)) {
+                // Preserve existing anchor but update ptrs_root if we have a new one
+                let updated_anchor = RootAnchor {
+                    spaces_root: existing.spaces_root,
+                    ptrs_root: ptrs_root.or(existing.ptrs_root),
+                    block: existing.block.clone(),
+                };
+                anchors.push(updated_anchor);
+            } else {
+                let spaces_root = sp_snap.compute_root()?;
+                anchors.push(RootAnchor {
+                    spaces_root,
+                    ptrs_root,
+                    block: anchor,
+                });
+            }
         }
+
+        let updated = serde_json::to_vec_pretty(&anchors)?;
+        fs::write(anchors_path, updated)?;
+
+        if let Some(result) = anchors.first() {
+            info!(
+                "Latest root anchor spaces={} ptrs={} (height: {})",
+                hex::encode(result.spaces_root),
+                result.ptrs_root.as_ref().map(hex::encode).unwrap_or_else(|| "none".to_string()),
+                result.block.height
+            );
+        }
+
         Ok(())
     }
 }

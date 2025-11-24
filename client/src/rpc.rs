@@ -48,7 +48,7 @@ use tokio::{
     task::JoinSet,
 };
 use spaces_protocol::hasher::Hash;
-use spaces_ptr::{PtrSource, FullPtrOut, PtrOut, Commitment, RegistryKey, CommitmentKey, RegistrySptrKey};
+use spaces_ptr::{PtrSource, FullPtrOut, PtrOut, Commitment, RegistryKey, CommitmentKey, RegistrySptrKey, PtrOutpointKey};
 use spaces_ptr::sptr::Sptr;
 use spaces_wallet::bitcoin::hashes::sha256;
 use crate::auth::BasicAuthLayer;
@@ -56,7 +56,7 @@ use crate::wallets::WalletInfoWithProgress;
 use crate::{
     calc_progress,
     checker::TxChecker,
-    client::{BlockMeta, TxEntry, BlockchainInfo},
+    client::{BlockMeta, PtrBlockMeta, TxEntry, BlockchainInfo},
     config::ExtendedNetwork,
     deserialize_base64, serialize_base64,
     source::BitcoinRpc,
@@ -93,7 +93,13 @@ pub struct RootAnchor {
         serialize_with = "serialize_hash",
         deserialize_with = "deserialize_hash"
     )]
-    pub root: spaces_protocol::hasher::Hash,
+    pub spaces_root: spaces_protocol::hasher::Hash,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_hash",
+        deserialize_with = "deserialize_optional_hash"
+    )]
+    pub ptrs_root: Option<spaces_protocol::hasher::Hash>,
     pub block: ChainAnchor,
 }
 
@@ -109,6 +115,13 @@ pub struct BlockMetaWithHash {
     pub hash: BlockHash,
     #[serde(flatten)]
     pub block_meta: BlockMeta,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtrBlockMetaWithHash {
+    pub hash: BlockHash,
+    #[serde(flatten)]
+    pub block_meta: PtrBlockMeta,
 }
 
 pub enum ChainStateCommand {
@@ -164,6 +177,10 @@ pub enum ChainStateCommand {
         height_or_hash: HeightOrHash,
         resp: Responder<anyhow::Result<BlockMetaWithHash>>,
     },
+    GetPtrBlockMeta {
+        height_or_hash: HeightOrHash,
+        resp: Responder<anyhow::Result<PtrBlockMetaWithHash>>,
+    },
     EstimateBid {
         target: usize,
         resp: Responder<anyhow::Result<u64>>,
@@ -188,6 +205,21 @@ pub enum ChainStateCommand {
     },
     ProveSpaceOutpoint {
         space_or_hash: String,
+        resp: Responder<anyhow::Result<ProofResult>>,
+    },
+    ProvePtrout {
+        outpoint: OutPoint,
+        prefer_recent: bool,
+        resp: Responder<anyhow::Result<ProofResult>>,
+    },
+    ProvePtrOutpoint {
+        sptr: Sptr,
+        resp: Responder<anyhow::Result<ProofResult>>,
+    },
+    ProveCommitment {
+        space: SLabel,
+        root: Hash,
+        prefer_recent: bool,
         resp: Responder<anyhow::Result<ProofResult>>,
     },
     GetRootAnchors {
@@ -262,6 +294,12 @@ pub trait Rpc {
         &self,
         height_or_hash: HeightOrHash,
     ) -> Result<BlockMetaWithHash, ErrorObjectOwned>;
+
+    #[method(name = "getptrblockmeta")]
+    async fn get_ptr_block_meta(
+        &self,
+        height_or_hash: HeightOrHash,
+    ) -> Result<PtrBlockMetaWithHash, ErrorObjectOwned>;
 
     #[method(name = "gettxmeta")]
     async fn get_tx_meta(&self, txid: Txid) -> Result<Option<TxEntry>, ErrorObjectOwned>;
@@ -359,6 +397,27 @@ pub trait Rpc {
         space_or_hash: &str,
     ) -> Result<ProofResult, ErrorObjectOwned>;
 
+    #[method(name = "proveptrout")]
+    async fn prove_ptrout(
+        &self,
+        outpoint: OutPoint,
+        prefer_recent: Option<bool>,
+    ) -> Result<ProofResult, ErrorObjectOwned>;
+
+    #[method(name = "proveptroutpoint")]
+    async fn prove_ptr_outpoint(
+        &self,
+        sptr: Sptr,
+    ) -> Result<ProofResult, ErrorObjectOwned>;
+
+    #[method(name = "provecommitment")]
+    async fn prove_commitment(
+        &self,
+        space: SLabel,
+        root: sha256::Hash,
+        prefer_recent: Option<bool>,
+    ) -> Result<ProofResult, ErrorObjectOwned>;
+
     #[method(name = "getrootanchors")]
     async fn get_root_anchors(&self) -> Result<Vec<RootAnchor>, ErrorObjectOwned>;
 
@@ -426,8 +485,12 @@ pub enum RpcWalletRequest {
     TransferPtr(TransferPtrParams),
     #[serde(rename = "createptr")]
     CreatePtr(CreatePtrParams),
+    #[serde(rename = "delegate")]
+    Delegate(DelegateParams),
     #[serde(rename = "commit")]
     Commit(CommitParams),
+    #[serde(rename = "setptrdata")]
+    SetPtrData(SetPtrDataParams),
     #[serde(rename = "send")]
     SendCoins(SendCoinsParams),
 }
@@ -452,9 +515,20 @@ pub struct CreatePtrParams {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct DelegateParams {
+    pub space: SLabel,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CommitParams {
     pub space: SLabel,
-    pub root: sha256::Hash,
+    pub root: Option<sha256::Hash>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SetPtrDataParams {
+    pub sptr: Sptr,
+    pub data: Vec<u8>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -537,6 +611,32 @@ where
         spaces_protocol::hasher::Hash::deserialize(deserializer)?;
     }
     Ok(bytes)
+}
+
+fn serialize_optional_hash<S>(
+    bytes: &Option<spaces_protocol::hasher::Hash>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match bytes {
+        Some(b) => serialize_hash(b, serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn deserialize_optional_hash<'de, D>(deserializer: D) -> Result<Option<spaces_protocol::hasher::Hash>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?
+        .map(|s| {
+            let mut bytes = [0u8; 32];
+            hex::decode_to_slice(s, &mut bytes).map_err(serde::de::Error::custom)?;
+            Ok(bytes)
+        })
+        .transpose()
 }
 
 #[derive(Clone)]
@@ -991,6 +1091,19 @@ impl RpcServer for RpcServerImpl {
         Ok(data)
     }
 
+    async fn get_ptr_block_meta(
+        &self,
+        height_or_hash: HeightOrHash,
+    ) -> Result<PtrBlockMetaWithHash, ErrorObjectOwned> {
+        let data = self
+            .store
+            .get_ptr_block_meta(height_or_hash)
+            .await
+            .map_err(|error| ErrorObjectOwned::owned(-1, error.to_string(), None::<String>))?;
+
+        Ok(data)
+    }
+
     async fn get_tx_meta(&self, txid: Txid) -> Result<Option<TxEntry>, ErrorObjectOwned> {
         let data = self
             .store
@@ -1181,6 +1294,39 @@ impl RpcServer for RpcServerImpl {
             .map_err(|error| ErrorObjectOwned::owned(-1, error.to_string(), None::<String>))
     }
 
+    async fn prove_ptrout(
+        &self,
+        outpoint: OutPoint,
+        prefer_recent: Option<bool>,
+    ) -> Result<ProofResult, ErrorObjectOwned> {
+        self.store
+            .prove_ptrout(outpoint, prefer_recent.unwrap_or(false))
+            .await
+            .map_err(|error| ErrorObjectOwned::owned(-1, error.to_string(), None::<String>))
+    }
+
+    async fn prove_ptr_outpoint(
+        &self,
+        sptr: Sptr,
+    ) -> Result<ProofResult, ErrorObjectOwned> {
+        self.store
+            .prove_ptr_outpoint(sptr)
+            .await
+            .map_err(|error| ErrorObjectOwned::owned(-1, error.to_string(), None::<String>))
+    }
+
+    async fn prove_commitment(
+        &self,
+        space: SLabel,
+        root: sha256::Hash,
+        prefer_recent: Option<bool>,
+    ) -> Result<ProofResult, ErrorObjectOwned> {
+        self.store
+            .prove_commitment(space, *root.as_ref(), prefer_recent.unwrap_or(false))
+            .await
+            .map_err(|error| ErrorObjectOwned::owned(-1, error.to_string(), None::<String>))
+    }
+
     async fn get_root_anchors(&self) -> Result<Vec<RootAnchor>, ErrorObjectOwned> {
         self.store
             .get_root_anchors()
@@ -1337,6 +1483,52 @@ impl AsyncChainState {
         })
     }
 
+    async fn get_indexed_ptr_block(
+        state: &mut Chain,
+        height_or_hash: HeightOrHash,
+        client: &reqwest::Client,
+        rpc: &BitcoinRpc,
+    ) -> Result<PtrBlockMetaWithHash, anyhow::Error> {
+        let hash = match height_or_hash {
+            HeightOrHash::Hash(hash) => hash,
+            HeightOrHash::Height(height) => rpc
+                .send_json(client, &rpc.get_block_hash(height))
+                .await
+                .map_err(|e| anyhow!("Could not retrieve block hash ({})", e))?,
+        };
+
+        if let Some(block_meta) = state.get_ptrs_block(hash)? {
+            return Ok(block_meta);
+        }
+
+        let info: serde_json::Value = rpc
+            .send_json(client, &rpc.get_block_header(&hash))
+            .await
+            .map_err(|e| anyhow!("Could not retrieve block ({})", e))?;
+
+        let height = info
+            .get("height")
+            .and_then(|t| t.as_u64())
+            .and_then(|h| u32::try_from(h).ok())
+            .ok_or_else(|| anyhow!("Could not retrieve block height"))?;
+
+        let ptrs_tip = state.ptrs_tip();
+        if height > ptrs_tip.height {
+            return Err(anyhow!(
+                "Ptrs is syncing at height {}, requested block height {}",
+                ptrs_tip.height,
+                height
+            ));
+        }
+        Ok(PtrBlockMetaWithHash {
+            hash,
+            block_meta: PtrBlockMeta {
+                height,
+                tx_meta: Vec::new(),
+            },
+        })
+    }
+
     pub async fn handle_command(
         client: &reqwest::Client,
         rpc: &BitcoinRpc,
@@ -1419,6 +1611,15 @@ impl AsyncChainState {
                         .await;
                 let _ = resp.send(res);
             }
+            ChainStateCommand::GetPtrBlockMeta {
+                height_or_hash,
+                resp,
+            } => {
+                let res =
+                    Self::get_indexed_ptr_block(state, height_or_hash, client, rpc)
+                        .await;
+                let _ = resp.send(res);
+            }
             ChainStateCommand::GetTxMeta { txid, resp } => {
                 let res = Self::get_indexed_tx(state, &txid, client, rpc).await;
                 let _ = resp.send(res);
@@ -1463,6 +1664,39 @@ impl AsyncChainState {
                     &space_or_hash,
                 ));
             }
+            ChainStateCommand::ProvePtrout {
+                outpoint,
+                prefer_recent,
+                resp,
+            } => {
+                _ = resp.send(Self::handle_prove_ptrout(
+                    state,
+                    outpoint,
+                    prefer_recent,
+                ));
+            }
+            ChainStateCommand::ProvePtrOutpoint {
+                sptr,
+                resp,
+            } => {
+                _ = resp.send(Self::handle_prove_ptr_outpoint(
+                    state,
+                    sptr,
+                ));
+            }
+            ChainStateCommand::ProveCommitment {
+                space,
+                root,
+                prefer_recent,
+                resp,
+            } => {
+                _ = resp.send(Self::handle_prove_commitment(
+                    state,
+                    space,
+                    root,
+                    prefer_recent,
+                ));
+            }
             ChainStateCommand::GetRootAnchors { resp } => {
                 _ = resp.send(Self::handle_get_anchor(anchors_path, state));
             }
@@ -1483,10 +1717,21 @@ impl AsyncChainState {
         }
 
         let snapshot = state.spaces_inner()?;
-        let root = snapshot.compute_root()?;
+        let spaces_root = snapshot.compute_root()?;
         let meta: ChainAnchor = snapshot.metadata().try_into()?;
+
+        // Try to compute PTR root if we're past PTR genesis
+        let ptrs_root = if state.can_scan_ptrs(meta.height) {
+            state.ptrs_mut().state.inner()
+                .ok()
+                .and_then(|s| s.compute_root().ok())
+        } else {
+            None
+        };
+
         Ok(vec![RootAnchor {
-            root,
+            spaces_root,
+            ptrs_root,
             block: ChainAnchor {
                 hash: meta.hash,
                 height: meta.height,
@@ -1590,6 +1835,112 @@ impl AsyncChainState {
         })
     }
 
+    fn handle_prove_ptr_outpoint(
+        state: &mut Chain,
+        sptr: Sptr,
+    ) -> anyhow::Result<ProofResult> {
+        let snapshot = state.ptrs_mut().state.inner()?;
+
+        // warm up hash cache
+        let root = snapshot.compute_root()?;
+        let proof = snapshot.prove(&[sptr.to_bytes().into()], ProofType::Standard)?;
+
+        let mut buf = vec![0u8; 4096];
+        let offset = proof.write_to_slice(&mut buf)?;
+        buf.truncate(offset);
+
+        Ok(ProofResult {
+            proof: buf,
+            root: Bytes::new(root.to_vec()),
+        })
+    }
+
+    fn handle_prove_ptrout(
+        state: &mut Chain,
+        outpoint: OutPoint,
+        prefer_recent: bool,
+    ) -> anyhow::Result<ProofResult> {
+        let key = PtrOutpointKey::from_outpoint::<Sha256>(outpoint);
+
+        let proof = if !prefer_recent {
+            let ptrout = match state.get_ptrout(&outpoint)? {
+                Some(ptrout) => ptrout,
+                None => {
+                    return Err(anyhow!(
+                        "Cannot find older proofs for a non-existent utxo (try with prefer_recent: true)"
+                    ))
+                }
+            };
+
+            // Use the last_update height from the PTR to find an appropriate snapshot
+            let target_snapshot = match &ptrout.sptr {
+                Some(ptr) => {
+                    let tip = state.ptrs_tip();
+                    Self::compute_target_snapshot(ptr.last_update, tip.height)
+                }
+                None => {
+                    return Err(anyhow!(
+                        "Cannot find older proofs for a UTXO without PTR data (try with prefer_recent: true)"
+                    ))
+                }
+            };
+            state.prove_ptrs_with_snapshot(&[key.into()], target_snapshot)?
+        } else {
+            let snapshot = state.ptrs_mut().state.inner()?;
+            snapshot.prove(&[key.into()], ProofType::Standard)?
+        };
+
+        let root = proof.compute_root()?.to_vec();
+        info!("Proving PTR with root anchor {}", hex::encode(root.as_slice()));
+        let mut buf = vec![0u8; 4096];
+        let offset = proof.write_to_slice(&mut buf)?;
+        buf.truncate(offset);
+
+        Ok(ProofResult {
+            proof: buf,
+            root: Bytes::new(root),
+        })
+    }
+
+    fn handle_prove_commitment(
+        state: &mut Chain,
+        space: SLabel,
+        root: Hash,
+        prefer_recent: bool,
+    ) -> anyhow::Result<ProofResult> {
+        let key = CommitmentKey::new::<Sha256>(&space, root);
+
+        let proof = if !prefer_recent {
+            let commitment = match state.get_commitment(&key)? {
+                Some(commitment) => commitment,
+                None => {
+                    return Err(anyhow!(
+                        "Cannot find older proofs for a non-existent commitment (try with prefer_recent: true)"
+                    ))
+                }
+            };
+
+            // Use the block_height from the commitment to find an appropriate snapshot
+            let tip = state.ptrs_tip();
+            let target_snapshot = Self::compute_target_snapshot(commitment.block_height, tip.height);
+            state.prove_ptrs_with_snapshot(&[key.into()], target_snapshot)?
+        } else {
+            let snapshot = state.ptrs_mut().state.inner()?;
+            snapshot.prove(&[key.into()], ProofType::Standard)?
+        };
+
+        let root = proof.compute_root()?.to_vec();
+        info!("Proving commitment with root anchor {}", hex::encode(root.as_slice()));
+        let mut buf = vec![0u8; 4096];
+        let offset = proof.write_to_slice(&mut buf)?;
+        buf.truncate(offset);
+
+        Ok(ProofResult {
+            proof: buf,
+            root: Bytes::new(root),
+        })
+    }
+
     pub async fn handler(
         client: &reqwest::Client,
         rpc: BitcoinRpc,
@@ -1661,6 +2012,51 @@ impl AsyncChainState {
         self.sender
             .send(ChainStateCommand::ProveSpaceOutpoint {
                 space_or_hash: space_or_hash.to_string(),
+                resp,
+            })
+            .await?;
+        resp_rx.await?
+    }
+
+    pub async fn prove_ptrout(
+        &self,
+        outpoint: OutPoint,
+        prefer_recent: bool,
+    ) -> anyhow::Result<ProofResult> {
+        let (resp, resp_rx) = oneshot::channel();
+        self.sender
+            .send(ChainStateCommand::ProvePtrout {
+                outpoint,
+                prefer_recent,
+                resp,
+            })
+            .await?;
+        resp_rx.await?
+    }
+
+    pub async fn prove_ptr_outpoint(&self, sptr: Sptr) -> anyhow::Result<ProofResult> {
+        let (resp, resp_rx) = oneshot::channel();
+        self.sender
+            .send(ChainStateCommand::ProvePtrOutpoint {
+                sptr,
+                resp,
+            })
+            .await?;
+        resp_rx.await?
+    }
+
+    pub async fn prove_commitment(
+        &self,
+        space: SLabel,
+        root: Hash,
+        prefer_recent: bool,
+    ) -> anyhow::Result<ProofResult> {
+        let (resp, resp_rx) = oneshot::channel();
+        self.sender
+            .send(ChainStateCommand::ProveCommitment {
+                space,
+                root,
+                prefer_recent,
                 resp,
             })
             .await?;
@@ -1788,6 +2184,20 @@ impl AsyncChainState {
         resp_rx.await?
     }
 
+    pub async fn get_ptr_block_meta(
+        &self,
+        height_or_hash: HeightOrHash,
+    ) -> anyhow::Result<PtrBlockMetaWithHash> {
+        let (resp, resp_rx) = oneshot::channel();
+        self.sender
+            .send(ChainStateCommand::GetPtrBlockMeta {
+                height_or_hash,
+                resp,
+            })
+            .await?;
+        resp_rx.await?
+    }
+
     pub async fn get_tx_meta(&self, txid: Txid) -> anyhow::Result<Option<TxEntry>> {
         let (resp, resp_rx) = oneshot::channel();
         self.sender
@@ -1864,7 +2274,12 @@ fn get_delegation(state: &mut Chain, space: SLabel) -> anyhow::Result<Option<Spt
     };
     let sptr = Sptr::from_spk::<Sha256>(info.spaceout.script_pubkey);
     let delegate = state.get_delegator(&RegistrySptrKey::from_sptr::<Sha256>(sptr))?;
-    Ok(delegate.map(|_| sptr))
+
+    // Only return the SPTR if the reverse mapping points back to this space
+    match delegate {
+        Some(delegator) if delegator == space => Ok(Some(sptr)),
+        _ => Ok(None),
+    }
 }
 
 fn get_commitment(state: &mut Chain, space: SLabel, root: Option<Hash>) -> anyhow::Result<Option<Commitment>> {
