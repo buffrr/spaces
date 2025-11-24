@@ -679,12 +679,8 @@ pub fn parse_ptr_op(tx: &Transaction) -> Option<PtrOp> {
                     Some(PtrOp::Commitment(CommitmentOp::Commit(commitments)))
                 }
                 x if x == PtrOpType::Data as u8 => {
-                    // Data: marker + payload
+                    // Data: marker + payload (payload can be empty)
                     let payload = &bytes[1..];
-                    if payload.is_empty() {
-                        return None;
-                    }
-
                     Some(PtrOp::Data(payload.as_bytes().to_vec()))
                 }
                 _ => None,

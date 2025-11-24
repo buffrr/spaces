@@ -35,7 +35,7 @@ use spaces_client::{
     serialize_base64,
     wallets::{AddressKind, WalletResponse},
 };
-use spaces_client::rpc::{CommitParams, CreatePtrParams, DelegateParams, TransferPtrParams};
+use spaces_client::rpc::{CommitParams, CreatePtrParams, DelegateParams, SetPtrDataParams, TransferPtrParams};
 use spaces_client::store::Sha256;
 use spaces_protocol::bitcoin::{Amount, FeeRate, OutPoint, Txid};
 use spaces_protocol::slabel::SLabel;
@@ -415,11 +415,11 @@ enum Commands {
         #[arg(default_value = "0")]
         target_interval: usize,
     },
-    /// Associate on-chain record data with a space as a fallback to P2P options like Fabric.
+    /// Associate on-chain record data with a space/sptr as a fallback to P2P options like Fabric.
     #[command(name = "setrawfallback")]
     SetRawFallback {
-        /// Space name
-        space: String,
+        /// Space name or SPTR identifier
+        space_or_sptr: String,
         /// Hex encoded data
         data: String,
         /// Fee rate to use in sat/vB
@@ -846,11 +846,10 @@ async fn handle_commands(cli: &SpaceCli, command: Commands) -> Result<(), Client
             .await?
         }
         Commands::SetRawFallback {
-            mut space,
+            space_or_sptr,
             data,
             fee_rate,
         } => {
-            space = normalize_space(&space);
             let data = match hex::decode(data) {
                 Ok(data) => data,
                 Err(e) => {
@@ -861,19 +860,35 @@ async fn handle_commands(cli: &SpaceCli, command: Commands) -> Result<(), Client
                 }
             };
 
-            let space_script =
-                spaces_protocol::script::SpaceScript::create_set_fallback(data.as_slice());
+            // Check if it's an SPTR (starts with "sptr1")
+            if space_or_sptr.starts_with("sptr1") {
+                let sptr = Sptr::from_str(&space_or_sptr).map_err(|e| {
+                    ClientError::Custom(format!("Invalid SPTR: {}", e))
+                })?;
+                cli.send_request(
+                    Some(RpcWalletRequest::SetPtrData(SetPtrDataParams { sptr, data })),
+                    None,
+                    fee_rate,
+                    false,
+                )
+                .await?;
+            } else {
+                // Space fallback: use existing space script
+                let space = normalize_space(&space_or_sptr);
+                let space_script =
+                    spaces_protocol::script::SpaceScript::create_set_fallback(data.as_slice());
 
-            cli.send_request(
-                Some(RpcWalletRequest::Execute(ExecuteParams {
-                    context: vec![space],
-                    space_script,
-                })),
-                None,
-                fee_rate,
-                false,
-            )
-            .await?;
+                cli.send_request(
+                    Some(RpcWalletRequest::Execute(ExecuteParams {
+                        context: vec![space],
+                        space_script,
+                    })),
+                    None,
+                    fee_rate,
+                    false,
+                )
+                .await?;
+            }
         }
         Commands::ListUnspent => {
             let utxos = cli.client.wallet_list_unspent(&cli.wallet).await?;

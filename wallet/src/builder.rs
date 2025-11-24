@@ -27,7 +27,7 @@ use spaces_protocol::{
     Covenant, FullSpaceOut, Space,
 };
 use spaces_protocol::hasher::Hash;
-use spaces_ptr::{create_commitment_script, CommitmentOp, FullPtrOut};
+use spaces_ptr::{create_commitment_script, create_data_script, CommitmentOp, FullPtrOut};
 use crate::{
     address::SpaceAddress, tx_event::TxRecord, DoubleUtxo, FullTxOut, SpaceScriptSigningInfo,
     SpacesWallet,
@@ -50,6 +50,9 @@ pub struct Builder {
     /// e.g. opens for name that already exist ... etc.
     /// enable only for testing purposes!
     force: bool,
+
+    /// Optional data to attach to PTR transfers via OP_RETURN
+    ptr_data: Option<Vec<u8>>,
 }
 
 pub struct BuilderIterator<'a> {
@@ -168,6 +171,7 @@ pub struct PtrParams {
     transfers: Vec<PtrTransfer>,
     binds: Vec<PtrRequest>,
     commitments: Vec<CommitmentRequest>,
+    data: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -717,6 +721,7 @@ impl Builder {
             fee_rate: None,
             bidouts: None,
             force: false,
+            ptr_data: None,
         }
     }
 
@@ -768,6 +773,11 @@ impl Builder {
 
     pub fn add_ptr_transfer(mut self, request: PtrTransfer) -> Self {
         self.requests.push(StackRequest::PtrTransfer(request));
+        self
+    }
+
+    pub fn add_ptr_data(mut self, data: Vec<u8>) -> Self {
+        self.ptr_data = Some(data);
         self
     }
 
@@ -913,6 +923,7 @@ impl Builder {
                 transfers: ptr_transfers,
                 binds: ptrs,
                 commitments,
+                data: self.ptr_data.clone(),
             };
             stack.push(StackOp::Ptr(params))
         }
@@ -981,6 +992,8 @@ impl Builder {
             return Ok(signed);
         }
 
+        let has_transfers = !params.transfers.is_empty();
+
         // Handle transfers:
         for transfer in params.transfers {
             let outpoint = OutPoint {
@@ -1001,6 +1014,14 @@ impl Builder {
                 ptr.spk,
                 ptr_utxo_dust(Amount::from_sat(1000)),
             );
+        }
+
+        // Add data OP_RETURN if present (only makes sense with transfers)
+        if let Some(data) = params.data {
+            if has_transfers {
+                let script = create_data_script(&data);
+                builder.add_recipient(script, Amount::from_sat(0));
+            }
         }
 
         let psbt = builder.finish()?;

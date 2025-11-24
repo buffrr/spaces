@@ -1367,6 +1367,31 @@ impl RpcWallet {
                         create_ptr: true,
                     });
                 }
+                RpcWalletRequest::SetPtrData(params) => {
+                    // Find the PTR UTXO
+                    let ptr_info = match chain.get_ptr_info(&params.sptr)? {
+                        None => return Err(anyhow!("setptrdata: PTR '{}' not found", params.sptr)),
+                        Some(ptr) if !wallet.is_mine(ptr.ptrout.script_pubkey.clone()) => {
+                            return Err(anyhow!("setptrdata: you don't own '{}'", params.sptr))
+                        }
+                        Some(ptr) if wallet.get_utxo(OutPoint::new(ptr.txid, ptr.ptrout.n as u32)).is_none() => {
+                            return Err(anyhow!(
+                                "setptrdata '{}': wallet already has a pending tx for this PTR",
+                                params.sptr
+                            ))
+                        }
+                        Some(ptr) => ptr,
+                    };
+
+                    // Transfer PTR to self with data
+                    let recipient = wallet.reveal_next_space_address();
+                    builder = builder
+                        .add_ptr_transfer(PtrTransfer {
+                            ptr: ptr_info,
+                            recipient,
+                        })
+                        .add_ptr_data(params.data);
+                }
             }
         }
 

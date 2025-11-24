@@ -7,7 +7,7 @@ use spaces_client::{
     },
     wallets::{AddressKind, WalletResponse},
 };
-use spaces_client::rpc::{CommitParams, CreatePtrParams, DelegateParams, TransferPtrParams, TransferSpacesParams};
+use spaces_client::rpc::{CommitParams, CreatePtrParams, DelegateParams, SetPtrDataParams, TransferPtrParams, TransferSpacesParams};
 use spaces_client::store::Sha256;
 use spaces_protocol::{bitcoin, bitcoin::{FeeRate}};
 use spaces_protocol::bitcoin::hashes::{sha256, Hash};
@@ -184,7 +184,7 @@ async fn it_should_commit_and_rollback(rig: &TestRig) -> anyhow::Result<()> {
     mine_and_sync(rig, 1).await?;
 
     // Verify delegation is set up
-    let sptr = rig.spaced.client.get_delegation(space_name.clone()).await?
+    rig.spaced.client.get_delegation(space_name.clone()).await?
         .expect("delegation should be established");
 
     // Test 1: Make initial commitment [1u8;32]
@@ -633,6 +633,122 @@ async fn it_should_reject_duplicate_sptr_delegations(rig: &TestRig) -> anyhow::R
     Ok(())
 }
 
+// ============== Test: PTR Data ==============
+
+async fn it_should_set_and_persist_ptr_data(rig: &TestRig) -> anyhow::Result<()> {
+    sync_all(rig).await?;
+
+    // Test 1: Create a PTR
+    println!("Test 1: Create PTR");
+    let addr0 = rig.spaced.client.wallet_get_new_address(ALICE, AddressKind::Coin).await?;
+    let addr0_spk = bitcoin::address::Address::from_str(&addr0)?
+        .assume_checked()
+        .script_pubkey();
+    let addr0_spk_string = hex::encode(addr0_spk.as_bytes());
+
+    wallet_do(
+        rig,
+        ALICE,
+        vec![RpcWalletRequest::CreatePtr(CreatePtrParams {
+            spk: addr0_spk_string,
+        })],
+        false,
+    ).await?;
+    mine_and_sync(rig, 1).await?;
+
+    let sptr = Sptr::from_spk::<Sha256>(addr0_spk.clone());
+    println!("SPTR created: {}", sptr);
+
+    // Verify PTR exists with no data
+    let ptr_initial = rig.spaced.client.get_ptr(sptr).await?
+        .expect("ptr should exist");
+    assert_eq!(ptr_initial.ptrout.sptr.as_ref().unwrap().data, None, "PTR should have no data initially");
+
+    // Test 2: Set data on the PTR
+    println!("\nTest 2: Set data on PTR");
+    let test_data = b"Hello, PTR data!".to_vec();
+    let set_data = wallet_do(
+        rig,
+        ALICE,
+        vec![RpcWalletRequest::SetPtrData(SetPtrDataParams {
+            sptr,
+            data: test_data.clone(),
+        })],
+        false,
+    ).await?;
+    assert!(wallet_res_err(&set_data).is_ok(), "SetPtrData should succeed");
+    mine_and_sync(rig, 1).await?;
+
+    // Verify data was set
+    let ptr_with_data = rig.spaced.client.get_ptr(sptr).await?
+        .expect("ptr should exist");
+    assert_eq!(ptr_with_data.ptrout.sptr.as_ref().unwrap().data, Some(test_data.clone()), "PTR data should be set");
+    println!("✓ PTR data set successfully: {:?}", String::from_utf8_lossy(&test_data));
+
+    // Test 3: Transfer PTR without data - data should persist
+    println!("\nTest 3: Transfer PTR without setting new data - data should persist");
+    let bob_addr = rig.spaced.client.wallet_get_new_address(BOB, AddressKind::Space).await?;
+    let transfer = wallet_do(
+        rig,
+        ALICE,
+        vec![RpcWalletRequest::TransferPtr(TransferPtrParams {
+            ptrs: vec![sptr],
+            to: bob_addr.clone(),
+        })],
+        false,
+    ).await?;
+    assert!(wallet_res_err(&transfer).is_ok(), "TransferPtr should succeed");
+    mine_and_sync(rig, 1).await?;
+
+    let ptr_after_transfer = rig.spaced.client.get_ptr(sptr).await?
+        .expect("ptr should exist after transfer");
+    assert_eq!(ptr_after_transfer.ptrout.sptr.as_ref().unwrap().data, Some(test_data.clone()),
+        "PTR data should persist after transfer without new data");
+    println!("✓ PTR data persisted after transfer");
+
+    // Test 4: Update data with new value
+    println!("\nTest 4: Update PTR data with new value");
+    let new_data = b"Updated data!".to_vec();
+    let update_data = wallet_do(
+        rig,
+        BOB,
+        vec![RpcWalletRequest::SetPtrData(SetPtrDataParams {
+            sptr,
+            data: new_data.clone(),
+        })],
+        false,
+    ).await?;
+    assert!(wallet_res_err(&update_data).is_ok(), "SetPtrData should succeed");
+    mine_and_sync(rig, 1).await?;
+
+    let ptr_updated = rig.spaced.client.get_ptr(sptr).await?
+        .expect("ptr should exist");
+    assert_eq!(ptr_updated.ptrout.sptr.as_ref().unwrap().data, Some(new_data.clone()), "PTR data should be updated");
+    println!("✓ PTR data updated successfully: {:?}", String::from_utf8_lossy(&new_data));
+
+    // Test 5: Set empty data
+    println!("\nTest 5: Set empty data");
+    let empty_data = Vec::new();
+    let set_empty = wallet_do(
+        rig,
+        BOB,
+        vec![RpcWalletRequest::SetPtrData(SetPtrDataParams {
+            sptr,
+            data: empty_data.clone(),
+        })],
+        false,
+    ).await?;
+    assert!(wallet_res_err(&set_empty).is_ok(), "SetPtrData with empty data should succeed");
+    mine_and_sync(rig, 1).await?;
+
+    let ptr_empty = rig.spaced.client.get_ptr(sptr).await?
+        .expect("ptr should exist");
+    assert_eq!(ptr_empty.ptrout.sptr.as_ref().unwrap().data, Some(empty_data), "PTR data should be set to empty");
+    println!("✓ PTR data set to empty successfully");
+
+    Ok(())
+}
+
 // ============== Main Test Runner ==============
 
 #[tokio::test]
@@ -665,6 +781,9 @@ async fn run_ptr_tests() -> anyhow::Result<()> {
 
     println!("\n=== Running PTR n→n Transfer Rule Tests ===");
     it_should_transfer_ptr_with_n_to_n_rule(&rig).await?;
+
+    println!("\n=== Running PTR Data Tests ===");
+    it_should_set_and_persist_ptr_data(&rig).await?;
 
     println!("\n=== All tests passed! ===");
     Ok(())

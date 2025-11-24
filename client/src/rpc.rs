@@ -489,6 +489,8 @@ pub enum RpcWalletRequest {
     Delegate(DelegateParams),
     #[serde(rename = "commit")]
     Commit(CommitParams),
+    #[serde(rename = "setptrdata")]
+    SetPtrData(SetPtrDataParams),
     #[serde(rename = "send")]
     SendCoins(SendCoinsParams),
 }
@@ -523,6 +525,11 @@ pub struct CommitParams {
     pub root: Option<sha256::Hash>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SetPtrDataParams {
+    pub sptr: Sptr,
+    pub data: Vec<u8>,
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SendCoinsParams {
