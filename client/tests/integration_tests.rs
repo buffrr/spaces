@@ -2,7 +2,7 @@ use std::{path::PathBuf, str::FromStr};
 
 use spaces_client::{
     rpc::{
-        BidParams, ExecuteParams, OpenParams, RegisterParams, RpcClient, RpcWalletRequest,
+        BidParams, OpenParams, RegisterParams, RpcClient, RpcWalletRequest,
         RpcWalletTxBuilder, TransferSpacesParams,
     },
     wallets::{AddressKind, WalletResponse},
@@ -10,7 +10,6 @@ use spaces_client::{
 use spaces_protocol::{
     bitcoin::{Amount, FeeRate},
     constants::RENEWAL_INTERVAL,
-    script::SpaceScript,
     Covenant,
 };
 use spaces_testutil::TestRig;
@@ -365,13 +364,19 @@ async fn it_should_allow_claim_on_or_after_claim_height(rig: &TestRig) -> anyhow
 async fn it_should_allow_batch_transfers_refreshing_expire_height(
     rig: &TestRig,
 ) -> anyhow::Result<()> {
+    use spaces_client::rpc::SpaceOrPtr;
+    use spaces_protocol::slabel::SLabel;
+
     rig.wait_until_wallet_synced(ALICE).await?;
     rig.wait_until_synced().await?;
     let all_spaces = rig.spaced.client.wallet_list_spaces(ALICE).await?;
     let registered_spaces: Vec<_> = all_spaces
         .owned
         .iter()
-        .map(|out| out.spaceout.space.as_ref().expect("space").name.to_string())
+        .map(|out| {
+            let name = out.spaceout.space.as_ref().expect("space").name.to_string();
+            SpaceOrPtr::Space(SLabel::from_str(&name).expect("valid space"))
+        })
         .collect();
 
     let space_address = rig
@@ -386,6 +391,7 @@ async fn it_should_allow_batch_transfers_refreshing_expire_height(
         vec![RpcWalletRequest::Transfer(TransferSpacesParams {
             spaces: registered_spaces.clone(),
             to: Some(space_address),
+            data: None,
         })],
         false,
     )
@@ -430,27 +436,30 @@ async fn it_should_allow_batch_transfers_refreshing_expire_height(
 }
 
 async fn it_should_allow_applying_script_in_batch(rig: &TestRig) -> anyhow::Result<()> {
+    use spaces_client::rpc::SpaceOrPtr;
+    use spaces_protocol::slabel::SLabel;
+
     rig.wait_until_wallet_synced(ALICE).await?;
     rig.wait_until_synced().await?;
     let all_spaces = rig.spaced.client.wallet_list_spaces(ALICE).await?;
     let registered_spaces: Vec<_> = all_spaces
         .owned
         .iter()
-        .map(|out| out.spaceout.space.as_ref().expect("space").name.to_string())
+        .map(|out| {
+            let name = out.spaceout.space.as_ref().expect("space").name.to_string();
+            SpaceOrPtr::Space(SLabel::from_str(&name).expect("valid space"))
+        })
         .collect();
 
     let result = wallet_do(
         rig,
         ALICE,
         vec![
-            // TODO: transfer then execute causes stack to be outdated
-            // RpcWalletRequest::Transfer(TransferSpacesParams {
-            //     spaces: registered_spaces.clone(),
-            //     to: addr,
-            // }),
-            RpcWalletRequest::Execute(ExecuteParams {
-                context: registered_spaces.clone(),
-                space_script: SpaceScript::create_set_fallback(&[0xDE, 0xAD, 0xBE, 0xEF]),
+            // Transfer spaces to self with data (replaces Execute)
+            RpcWalletRequest::Transfer(TransferSpacesParams {
+                spaces: registered_spaces.clone(),
+                to: None, // None = renew to self
+                data: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
             }),
         ],
         false,
@@ -852,13 +861,17 @@ async fn it_should_not_allow_register_or_transfer_to_same_space_multiple_times(
         .wallet_get_new_address(BOB, AddressKind::Space)
         .await?;
 
+    use spaces_client::rpc::SpaceOrPtr;
+    use spaces_protocol::slabel::SLabel;
+
     let transfer = "@test9995".to_string();
     let response = wallet_do(
         rig,
         ALICE,
         vec![RpcWalletRequest::Transfer(TransferSpacesParams {
-            spaces: vec![transfer.clone()],
+            spaces: vec![SpaceOrPtr::Space(SLabel::from_str(&transfer).expect("valid"))],
             to: Some(bob_address.clone()),
+            data: None,
         })],
         false,
     )
@@ -874,8 +887,9 @@ async fn it_should_not_allow_register_or_transfer_to_same_space_multiple_times(
         rig,
         ALICE,
         vec![RpcWalletRequest::Transfer(TransferSpacesParams {
-            spaces: vec![transfer],
+            spaces: vec![SpaceOrPtr::Space(SLabel::from_str(&transfer).expect("valid"))],
             to: Some(bob_address),
+            data: None,
         })],
         false,
     )
@@ -886,9 +900,10 @@ async fn it_should_not_allow_register_or_transfer_to_same_space_multiple_times(
     let response = wallet_do(
         rig,
         ALICE,
-        vec![RpcWalletRequest::Execute(ExecuteParams {
-            context: vec![setdata.clone()],
-            space_script: SpaceScript::create_set_fallback(&[0xAA, 0xAA]),
+        vec![RpcWalletRequest::Transfer(TransferSpacesParams {
+            spaces: vec![SpaceOrPtr::Space(SLabel::from_str(&setdata).expect("valid"))],
+            to: None,
+            data: Some(vec![0xAA, 0xAA]),
         })],
         false,
     )
@@ -902,9 +917,10 @@ async fn it_should_not_allow_register_or_transfer_to_same_space_multiple_times(
     wallet_do(
         rig,
         ALICE,
-        vec![RpcWalletRequest::Execute(ExecuteParams {
-            context: vec![setdata],
-            space_script: SpaceScript::create_set_fallback(&[0xDE, 0xAD]),
+        vec![RpcWalletRequest::Transfer(TransferSpacesParams {
+            spaces: vec![SpaceOrPtr::Space(SLabel::from_str(&setdata).expect("valid"))],
+            to: None,
+            data: Some(vec![0xDE, 0xAD]),
         })],
         false,
     )
@@ -940,6 +956,9 @@ async fn it_should_not_allow_register_or_transfer_to_same_space_multiple_times(
 }
 
 async fn it_can_batch_txs(rig: &TestRig) -> anyhow::Result<()> {
+    use spaces_client::rpc::SpaceOrPtr;
+    use spaces_protocol::slabel::SLabel;
+
     rig.wait_until_wallet_synced(ALICE).await.expect("synced");
     let bob_address = rig
         .spaced
@@ -951,8 +970,9 @@ async fn it_can_batch_txs(rig: &TestRig) -> anyhow::Result<()> {
         ALICE,
         vec![
             RpcWalletRequest::Transfer(TransferSpacesParams {
-                spaces: vec!["@test9996".to_string()],
+                spaces: vec![SpaceOrPtr::Space(SLabel::from_str("@test9996").expect("valid"))],
                 to: Some(bob_address),
+                data: None,
             }),
             RpcWalletRequest::Bid(BidParams {
                 name: "@test100".to_string(),
@@ -966,14 +986,15 @@ async fn it_can_batch_txs(rig: &TestRig) -> anyhow::Result<()> {
                 name: "@batch1".to_string(),
                 amount: 1000,
             }),
-            RpcWalletRequest::Execute(ExecuteParams {
-                context: vec![
-                    "@test10000".to_string(),
-                    "@test9999".to_string(),
-                    "@test9998".to_string(),
+            // Transfer spaces to self with data (replaces Execute)
+            RpcWalletRequest::Transfer(TransferSpacesParams {
+                spaces: vec![
+                    SpaceOrPtr::Space(SLabel::from_str("@test10000").expect("valid")),
+                    SpaceOrPtr::Space(SLabel::from_str("@test9999").expect("valid")),
+                    SpaceOrPtr::Space(SLabel::from_str("@test9998").expect("valid")),
                 ],
-                // space_script: SpaceScript::create_set_fallback(&[0xEE, 0xEE, 0x22, 0x22]),
-                space_script: SpaceScript::create_set_fallback(&[0xEE, 0xEE, 0x22, 0x22]),
+                to: None,
+                data: Some(vec![0xEE, 0xEE, 0x22, 0x22]),
             }),
         ],
         false,
@@ -989,7 +1010,8 @@ async fn it_can_batch_txs(rig: &TestRig) -> anyhow::Result<()> {
         res.result.iter().all(|tx| tx.error.is_none()),
         "batching should work"
     );
-    assert_eq!(res.result.len(), 5, "expected 4 transactions");
+    // TODO: technically data should be its own tx
+    assert_eq!(res.result.len(), 4, "expected 4 transactions");
 
     rig.mine_blocks(1, None).await.expect("mine");
     rig.wait_until_wallet_synced(ALICE).await.expect("synced");
@@ -1095,65 +1117,6 @@ async fn it_can_batch_txs(rig: &TestRig) -> anyhow::Result<()> {
             }
             _ => panic!("must be a transfer"),
         }
-    }
-
-    Ok(())
-}
-
-async fn it_can_use_reserved_op_codes(rig: &TestRig) -> anyhow::Result<()> {
-    rig.wait_until_wallet_synced(ALICE).await.expect("synced");
-    let alice_spaces = vec![
-        "@test10000".to_string(),
-        "@test9999".to_string(),
-        "@test9998".to_string(),
-    ];
-
-    let res = rig
-        .spaced
-        .client
-        .wallet_send_request(
-            ALICE,
-            RpcWalletTxBuilder {
-                bidouts: None,
-                requests: vec![RpcWalletRequest::Execute(ExecuteParams {
-                    context: alice_spaces.clone(),
-                    space_script: SpaceScript::create_reserve(),
-                })],
-                fee_rate: Some(FeeRate::from_sat_per_vb(1).expect("fee")),
-                dust: None,
-                force: true,
-                confirmed_only: false,
-                skip_tx_check: true,
-            },
-        )
-        .await
-        .expect("response");
-
-    assert!(
-        res.result.iter().all(|tx| tx.error.is_none()),
-        "reserve should work"
-    );
-    assert_eq!(res.result.len(), 2, "expected 2 transactions");
-
-    rig.mine_blocks(1, None).await.expect("mine");
-    rig.wait_until_wallet_synced(ALICE).await.expect("synced");
-
-    for space in alice_spaces {
-        let space = rig
-            .spaced
-            .client
-            .get_space(&space)
-            .await
-            .expect("space")
-            .expect("space exists")
-            .spaceout
-            .space
-            .expect("space exists");
-
-        assert!(
-            matches!(space.covenant, Covenant::Reserved),
-            "expected a reserved space"
-        );
     }
 
     Ok(())
@@ -1349,9 +1312,6 @@ async fn run_auction_tests() -> anyhow::Result<()> {
         .await
         .expect("should not allow register/transfer multiple times");
     it_can_batch_txs(&rig).await.expect("bump fee");
-    it_can_use_reserved_op_codes(&rig)
-        .await
-        .expect("should use reserved opcodes");
     it_should_allow_buy_sell(&rig)
         .await
         .expect("should allow buy sell");

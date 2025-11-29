@@ -10,7 +10,6 @@ use spaces_protocol::{
     bitcoin::Txid,
     constants::ChainAnchor,
     hasher::{KeyHasher, SpaceKey},
-    script::SpaceScript,
     slabel::SLabel,
     FullSpaceOut, SpaceOut,
 };
@@ -44,7 +43,7 @@ use crate::{calc_progress, checker::TxChecker, client::BlockSource, config::Exte
     BitcoinBlockSource, BitcoinRpc, BitcoinRpcError, BlockEvent, BlockFetchError, BlockFetcher,
 }, std_wait};
 use crate::cbf::{CompactFilterSync};
-use crate::rpc::CommitParams;
+use crate::rpc::{CommitParams, SpaceOrPtr};
 use crate::spaces::Spaced;
 use crate::store::chain::Chain;
 use crate::store::Sha256;
@@ -1110,15 +1109,6 @@ impl RpcWallet {
                     });
                 }
                 RpcWalletRequest::Transfer(params) => {
-                    let spaces: Vec<_> = params
-                        .spaces
-                        .iter()
-                        .filter_map(|space| SLabel::from_str(space).ok())
-                        .collect();
-                    if spaces.len() != params.spaces.len() {
-                        return Err(anyhow!("transfer: some names were malformed"));
-                    }
-
                     let recipient = if let Some(to) = params.to {
                         match Self::resolve(network, chain, &to, true)? {
                             None => return Err(anyhow!("transfer: could not resolve '{}'", to)),
@@ -1128,44 +1118,81 @@ impl RpcWallet {
                         None
                     };
 
-                    for space in spaces {
-                        let spacehash = SpaceKey::from(Sha256::hash(space.as_ref()));
-                        match chain.get_space_info(&spacehash)? {
-                            None => return Err(anyhow!("transfer: you don't own `{}`", space)),
-                            Some(full)
-                            if full.spaceout.space.is_none()
-                                || !full.spaceout.space.as_ref().unwrap().is_owned()
-                                || !wallet.is_mine(full.spaceout.script_pubkey.clone()) =>
-                                {
-                                    return Err(anyhow!("transfer: you don't own `{}`", space));
-                                }
-
-                            Some(full) if wallet.get_utxo(full.outpoint()).is_none() => {
-                                return Err(anyhow!(
-                                    "transfer '{}': wallet already has a pending tx for this space",
-                                    space
-                                ));
-                            }
-
-                            Some(full) => {
-                                let recipient = match recipient.clone() {
-                                    None => SpaceAddress(
-                                        Address::from_script(
-                                            full.spaceout.script_pubkey.as_script(),
-                                            wallet.config.network,
-                                        )
-                                            .expect("valid script"),
-                                    ),
-                                    Some(addr) => SpaceAddress(addr),
+                    // Process each item - either a space or PTR
+                    for item in &params.spaces {
+                        match item {
+                            SpaceOrPtr::Ptr(sptr) => {
+                                // Handle PTR transfer
+                                let ptr = match chain.get_ptr_info(sptr)? {
+                                    None => return Err(anyhow!("transfer: PTR '{}' not found or not owned", sptr)),
+                                    Some(full) if !wallet.is_mine(full.ptrout.script_pubkey.clone()) => {
+                                        return Err(anyhow!("transfer: you don't own PTR '{}'", sptr))
+                                    }
+                                    Some(full) if wallet.get_utxo(OutPoint::new(full.txid, full.ptrout.n as u32)).is_none() => {
+                                        return Err(anyhow!(
+                                            "transfer '{}': wallet already has a pending tx for this PTR",
+                                            sptr
+                                        ))
+                                    }
+                                    Some(full) => full,
                                 };
 
-                                builder = builder.add_transfer(SpaceTransfer {
-                                    space: full,
-                                    recipient: recipient.clone(),
-                                    create_ptr: false,
+                                let recipient_addr = match recipient.clone() {
+                                    None => wallet.reveal_next_space_address(),
+                                    Some(addr) => SpaceAddress::from(addr),
+                                };
+
+                                builder = builder.add_ptr_transfer(PtrTransfer {
+                                    ptr,
+                                    recipient: recipient_addr,
                                 });
                             }
-                        };
+                            SpaceOrPtr::Space(space) => {
+                                // Handle space transfer
+                                let spacehash = SpaceKey::from(Sha256::hash(space.as_ref()));
+                                match chain.get_space_info(&spacehash)? {
+                                    None => return Err(anyhow!("transfer: you don't own `{}`", space)),
+                                    Some(full)
+                                    if full.spaceout.space.is_none()
+                                        || !full.spaceout.space.as_ref().unwrap().is_owned()
+                                        || !wallet.is_mine(full.spaceout.script_pubkey.clone()) =>
+                                        {
+                                            return Err(anyhow!("transfer: you don't own `{}`", space));
+                                        }
+
+                                    Some(full) if wallet.get_utxo(full.outpoint()).is_none() => {
+                                        return Err(anyhow!(
+                                            "transfer '{}': wallet already has a pending tx for this space",
+                                            space
+                                        ));
+                                    }
+
+                                    Some(full) => {
+                                        let recipient_addr = match recipient.clone() {
+                                            None => SpaceAddress(
+                                                Address::from_script(
+                                                    full.spaceout.script_pubkey.as_script(),
+                                                    wallet.config.network,
+                                                )
+                                                    .expect("valid script"),
+                                            ),
+                                            Some(addr) => SpaceAddress(addr),
+                                        };
+
+                                        builder = builder.add_transfer(SpaceTransfer {
+                                            space: full,
+                                            recipient: recipient_addr.clone(),
+                                            create_ptr: false,
+                                        });
+                                    }
+                                };
+                            }
+                        }
+                    }
+
+                    // Add data OP_RETURN if present
+                    if let Some(data) = params.data {
+                        builder = builder.add_data(data);
                     }
                 }
                 RpcWalletRequest::Open(params) => {
@@ -1253,54 +1280,6 @@ impl RpcWallet {
                     };
 
                     builder = builder.add_register(utxo, Some(address));
-                }
-                RpcWalletRequest::Execute(params) => {
-                    let mut spaces = Vec::new();
-                    for space in params.context.iter() {
-                        let name = SLabel::from_str(&space)?;
-                        let spacehash = SpaceKey::from(Sha256::hash(name.as_ref()));
-                        let spaceout = chain.get_space_info(&spacehash)?;
-                        if spaceout.is_none() {
-                            return Err(anyhow!("script '{}': space does not exist", space));
-                        }
-                        let spaceout = spaceout.unwrap();
-                        if !wallet.is_mine(spaceout.spaceout.script_pubkey.clone()) {
-                            return Err(anyhow!("script '{}': you don't own this space", space));
-                        }
-
-                        if wallet.get_utxo(spaceout.outpoint()).is_none() {
-                            return Err(anyhow!(
-                                "script '{}': wallet already has a pending tx for this space",
-                                space
-                            ));
-                        }
-
-                        let address = wallet.next_unused_space_address();
-                        spaces.push(SpaceTransfer {
-                            space: spaceout,
-                            recipient: address,
-                            create_ptr: false,
-                        });
-                    }
-
-                    let script = SpaceScript::nop_script(params.space_script);
-                    builder = builder.add_execute(spaces, script);
-                }
-                RpcWalletRequest::TransferPtr(params) => {
-                    let recipient = match Self::resolve(network, chain, &params.to, true)? {
-                        None => return Err(anyhow!("transferptr: could not resolve '{}'", params.to)),
-                        Some(r) => r,
-                    };
-                    for sptr in params.ptrs {
-                        let ptr = match chain.get_ptr_info(&sptr)? {
-                            None => return Err(anyhow!("transferptr: you don't own `{}`", sptr)),
-                            Some(full) => full,
-                        };
-                        builder = builder.add_ptr_transfer(PtrTransfer {
-                            ptr,
-                            recipient: SpaceAddress::from(recipient.clone()),
-                        });
-                    }
                 }
                 RpcWalletRequest::CreatePtr(params) => {
                     let spk_raw = hex::decode(params.spk)
@@ -1390,7 +1369,7 @@ impl RpcWallet {
                             ptr: ptr_info,
                             recipient,
                         })
-                        .add_ptr_data(params.data);
+                        .add_data(params.data);
                 }
             }
         }
