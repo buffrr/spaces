@@ -23,11 +23,11 @@ use bitcoin::{
 use spaces_protocol::{
     bitcoin::absolute::Height,
     constants::{BID_PSBT_INPUT_SEQUENCE, BID_PSBT_TX_VERSION},
-    script::SpaceScript,
     Covenant, FullSpaceOut, Space,
 };
 use spaces_protocol::hasher::Hash;
-use spaces_ptr::{create_commitment_script, create_data_script, CommitmentOp, FullPtrOut};
+use spaces_protocol::script::{create_data_script, create_open_data, nop_script};
+use spaces_ptr::{create_commitment_script, CommitmentOp, FullPtrOut};
 use crate::{
     address::SpaceAddress, tx_event::TxRecord, DoubleUtxo, FullTxOut, SpaceScriptSigningInfo,
     SpacesWallet,
@@ -52,7 +52,7 @@ pub struct Builder {
     force: bool,
 
     /// Optional data to attach to PTR transfers via OP_RETURN
-    ptr_data: Option<Vec<u8>>,
+    data: Option<Vec<u8>>,
 }
 
 pub struct BuilderIterator<'a> {
@@ -95,7 +95,6 @@ pub enum StackOp {
     Prepare(CreateParams),
     Open(OpenRevealParams),
     Bid(BidRequest),
-    Execute(ExecuteParams),
     Ptr(PtrParams),
 }
 
@@ -110,11 +109,6 @@ pub struct OpenRevealParams {
     space: String,
     initial_bid: Amount,
     script: SpaceScriptRevealParams,
-}
-
-pub struct ExecuteParams {
-    context: Vec<SpaceTransfer>,
-    reveal: SpaceScriptRevealParams,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +159,7 @@ pub struct CreateParams {
     transfers: Vec<SpaceTransfer>,
     sends: Vec<CoinTransfer>,
     bidouts: Option<u8>,
+    data: Option<Vec<u8>>
 }
 
 pub struct PtrParams {
@@ -361,6 +356,7 @@ impl Builder {
         fee_rate: FeeRate,
         dust: Option<Amount>,
         confirmed_only: bool,
+        data: Option<Vec<u8>>
     ) -> anyhow::Result<(Transaction, Vec<FullTxOut>)> {
         let mut vout: u32 = 0;
         let mut tap_outputs = Vec::new();
@@ -447,10 +443,15 @@ impl Builder {
 
             // Add PTR outputs for delegations
             if !ptr_addresses.is_empty() {
-                // Add dummy output to absorb conflicts from PTR inputs using n+1 rule
-                // This is a temporary workaround until we have better change output control
-                let dummy_dust = Amount::from_sat(546);
-                builder.add_recipient(change_address.clone(), dummy_dust);
+                if let Some(data) = data {
+                    let data_script = create_data_script(&data);
+                    builder.add_recipient(data_script, Amount::from_sat(0));
+                } else {
+                    // Add dummy output to absorb conflicts from PTR inputs using n+1 rule
+                    // This is a temporary workaround until we have better change output control
+                    let dummy_dust = Amount::from_sat(546);
+                    builder.add_recipient(change_address.clone(), dummy_dust);
+                }
                 vout += 1;
 
                 for spk in ptr_addresses {
@@ -460,6 +461,9 @@ impl Builder {
                     );
                     vout += 1;
                 }
+            } else if let Some(data) = data {
+                let data_script = create_data_script(&data);
+                builder.add_recipient(data_script, Amount::from_sat(0));
             }
 
             builder.fee_rate(fee_rate);
@@ -513,17 +517,6 @@ impl Iterator for BuilderIterator<'_> {
                     reveals.push(tap.unwrap());
                 }
 
-                let mut contexts = Vec::with_capacity(params.executes.len());
-                for execute in params.executes {
-                    let signing_info =
-                        SpaceScriptSigningInfo::new(self.wallet.config.network, execute.script);
-                    if signing_info.is_err() {
-                        return Some(Err(signing_info.unwrap_err()));
-                    }
-                    reveals.push(signing_info.unwrap());
-                    contexts.push(execute.context);
-                }
-
                 let (tx, commitments) = match Builder::prepare_all(
                     self.median_time,
                     self.wallet,
@@ -535,6 +528,7 @@ impl Iterator for BuilderIterator<'_> {
                     self.fee_rate,
                     self.dust,
                     self.confirmed_only,
+                    params.data,
                 ) {
                     Ok(prep) => prep,
                     Err(err) => return Some(Err(err)),
@@ -575,33 +569,6 @@ impl Iterator for BuilderIterator<'_> {
                             commitment,
                         },
                     }));
-                }
-
-                for ((signing, commitment), context) in
-                    reveals_iter.zip(commitments_iter).zip(contexts)
-                {
-                    // script applies to every space in context
-                    for transfer in context.iter() {
-                        detailed_tx.add_commitment(
-                            transfer
-                                .space
-                                .spaceout
-                                .space
-                                .as_ref()
-                                .expect("space")
-                                .name
-                                .to_string(),
-                            commitment.txout.script_pubkey.clone(),
-                            signing.to_vec(),
-                        );
-                    }
-                    self.stack.push(StackOp::Execute(ExecuteParams {
-                        reveal: SpaceScriptRevealParams {
-                            signing,
-                            commitment,
-                        },
-                        context,
-                    }))
                 }
 
                 if !params.transfers.is_empty() {
@@ -657,28 +624,6 @@ impl Iterator for BuilderIterator<'_> {
                     detailed
                 }))
             }
-            StackOp::Execute(params) => {
-                let spaces = params.context.clone();
-                let res = Builder::execute_tx(
-                    self.wallet,
-                    params,
-                    self.fee_rate,
-                    self.unspendables.clone(),
-                    self.confirmed_only,
-                    self.force,
-                );
-
-                Some(res.map(|(tx, reveal_input_index)| {
-                    let mut detailed = TxRecord::new(tx);
-                    for space in spaces {
-                        detailed.add_execute(
-                            space.space.spaceout.space.expect("space").name.to_string(),
-                            reveal_input_index,
-                        );
-                    }
-                    detailed
-                }))
-            }
             StackOp::Bid(bid) => {
                 let tx = Builder::bid_tx(
                     self.wallet,
@@ -721,7 +666,7 @@ impl Builder {
             fee_rate: None,
             bidouts: None,
             force: false,
-            ptr_data: None,
+            data: None,
         }
     }
 
@@ -776,8 +721,8 @@ impl Builder {
         self
     }
 
-    pub fn add_ptr_data(mut self, data: Vec<u8>) -> Self {
-        self.ptr_data = Some(data);
+    pub fn add_data(mut self, data: Vec<u8>) -> Self {
+        self.data = Some(data);
         self
     }
 
@@ -915,6 +860,7 @@ impl Builder {
                 transfers,
                 sends,
                 bidouts: auction_outputs,
+                data: self.data.clone(),
             }));
         }
 
@@ -923,7 +869,7 @@ impl Builder {
                 transfers: ptr_transfers,
                 binds: ptrs,
                 commitments,
-                data: self.ptr_data.clone(),
+                data: self.data.clone(),
             };
             stack.push(StackOp::Ptr(params))
         }
@@ -1094,55 +1040,12 @@ impl Builder {
         Ok(signed)
     }
 
-    fn execute_tx(
-        w: &mut SpacesWallet,
-        params: ExecuteParams,
-        fee_rate: FeeRate,
-        unspendables: Vec<OutPoint>,
-        confirmed_only: bool,
-        _force: bool,
-    ) -> anyhow::Result<(Transaction, usize)> {
-        let mut extra_prevouts = BTreeMap::new();
-        let reveal_input_index;
-        let reveal_psbt = {
-            let change_address = w
-                .internal
-                .next_unused_address(KeychainKind::Internal)
-                .script_pubkey();
-            let mut builder = w.build_tx(unspendables, confirmed_only)?;
-
-            builder
-                // TODO: avoid this! added first to keep an odd number of outputs before adding transfers
-                .add_recipient(change_address, Amount::from_sat(2000));
-
-            extra_prevouts.insert(
-                params.reveal.commitment.outpoint,
-                params.reveal.commitment.txout.clone(),
-            );
-
-            let input_count = params.context.len();
-            for transfer in params.context {
-                builder.add_transfer(transfer)?;
-            }
-
-            reveal_input_index = input_count + 1;
-            builder
-                // add reveal last to not disrupt space inputs order
-                .add_reveal(params.reveal.commitment, params.reveal.signing)?
-                .fee_rate(fee_rate);
-            builder.finish()?
-        };
-
-        let signed = w.sign(reveal_psbt, Some(extra_prevouts))?;
-        Ok((signed, reveal_input_index))
-    }
-
     fn create_open_tap_data(
         network: Network,
         name: &str,
     ) -> anyhow::Result<SpaceScriptSigningInfo> {
         let sname = spaces_protocol::slabel::SLabel::from_str(name).expect("valid space name");
-        let nop = SpaceScript::nop_script(SpaceScript::create_open(sname));
+        let nop = nop_script(create_open_data(sname));
         SpaceScriptSigningInfo::new(network, nop)
     }
 }

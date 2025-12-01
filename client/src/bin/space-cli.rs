@@ -29,13 +29,13 @@ use spaces_client::{
         print_wallet_balance_response, print_wallet_info, print_wallet_response, Format,
     },
     rpc::{
-        BidParams, ExecuteParams, OpenParams, RegisterParams, RpcClient, RpcWalletRequest,
+        BidParams, OpenParams, RegisterParams, RpcClient, RpcWalletRequest,
         RpcWalletTxBuilder, SendCoinsParams, TransferSpacesParams,
     },
     serialize_base64,
     wallets::{AddressKind, WalletResponse},
 };
-use spaces_client::rpc::{CommitParams, CreatePtrParams, DelegateParams, SetPtrDataParams, TransferPtrParams};
+use spaces_client::rpc::{CommitParams, CreatePtrParams, DelegateParams, SetPtrDataParams};
 use spaces_client::store::Sha256;
 use spaces_protocol::bitcoin::{Amount, FeeRate, OutPoint, Txid};
 use spaces_protocol::slabel::SLabel;
@@ -166,34 +166,21 @@ enum Commands {
         /// The sha256 hash of the spk or the spk itself prefixed with hex:
         spk: String,
     },
-    /// Transfer ownership of a set of spaces to the given name or address
+    /// Transfer ownership of spaces and/or PTRs to the given name or address
     #[command(
         name = "transfer",
-        override_usage = "space-cli transfer [SPACES]... --to <SPACE-OR-ADDRESS>"
+        override_usage = "space-cli transfer [SPACES-OR-PTRS]... --to <SPACE-OR-ADDRESS> [--data <DATA>]"
     )]
     Transfer {
-        /// Spaces to send
+        /// Spaces (e.g., @bitcoin) and/or PTRs (e.g., sptr1...) to send
         #[arg(display_order = 0)]
         spaces: Vec<String>,
-        /// Recipient space name or address (must be a space address)
+        /// Recipient space name or address
         #[arg(long, display_order = 1)]
         to: String,
-        /// Fee rate to use in sat/vB
-        #[arg(long, short)]
-        fee_rate: Option<u64>,
-    },
-    /// Transfer ownership of a set of ptrs to the given name or address
-    #[command(
-        name = "transferptr",
-        override_usage = "space-cli transferptr [PTRS]... --to <SPACE-OR-ADDRESS>"
-    )]
-    TransferPtr {
-        /// Ptrs to send
-        #[arg(display_order = 0)]
-        ptrs: Vec<String>,
-        /// Recipient space name or address (must be a space address)
-        #[arg(long, display_order = 1)]
-        to: String,
+        /// Optional data to set on all transferred spaces/PTRs (hex-encoded)
+        #[arg(long, display_order = 2)]
+        data: Option<String>,
         /// Fee rate to use in sat/vB
         #[arg(long, short)]
         fee_rate: Option<u64>,
@@ -800,11 +787,16 @@ async fn handle_commands(cli: &SpaceCli, command: Commands) -> Result<(), Client
             .await?
         }
         Commands::Renew { spaces, fee_rate } => {
-            let spaces: Vec<_> = spaces.into_iter().map(|s| normalize_space(&s)).collect();
+            use spaces_client::rpc::SpaceOrPtr;
+            let spaces: Vec<_> = spaces.into_iter().map(|s| {
+                let normalized = normalize_space(&s);
+                SpaceOrPtr::Space(SLabel::from_str(&normalized).expect("valid space"))
+            }).collect();
             cli.send_request(
                 Some(RpcWalletRequest::Transfer(TransferSpacesParams {
                     spaces,
                     to: None,
+                    data: None,
                 })),
                 None,
                 fee_rate,
@@ -815,13 +807,41 @@ async fn handle_commands(cli: &SpaceCli, command: Commands) -> Result<(), Client
         Commands::Transfer {
             spaces,
             to,
+            data,
             fee_rate,
         } => {
-            let spaces: Vec<_> = spaces.into_iter().map(|s| normalize_space(&s)).collect();
+            use spaces_client::rpc::SpaceOrPtr;
+            // Parse spaces and PTRs into SpaceOrPtr
+            let spaces: Result<Vec<_>, _> = spaces.into_iter().map(|s| {
+                if s.starts_with("sptr1") {
+                    // Parse as SPTR
+                    Sptr::from_str(&s).map(SpaceOrPtr::Ptr)
+                        .map_err(|e| ClientError::Custom(format!("Invalid SPTR '{}': {}", s, e)))
+                } else {
+                    // Normalize and parse as space
+                    let normalized = normalize_space(&s);
+                    SLabel::from_str(&normalized).map(SpaceOrPtr::Space)
+                        .map_err(|e| ClientError::Custom(format!("Invalid space '{}': {}", s, e)))
+                }
+            }).collect();
+            let spaces = spaces?;
+
+            // Parse hex data if present
+            let data = match data {
+                Some(hex_str) => {
+                    let data = hex::decode(hex_str).map_err(|e| {
+                        ClientError::Custom(format!("Invalid hex data: {}", e))
+                    })?;
+                    Some(data)
+                }
+                None => None,
+            };
+
             cli.send_request(
                 Some(RpcWalletRequest::Transfer(TransferSpacesParams {
                     spaces,
                     to: Some(to),
+                    data,
                 })),
                 None,
                 fee_rate,
@@ -873,21 +893,22 @@ async fn handle_commands(cli: &SpaceCli, command: Commands) -> Result<(), Client
                 )
                 .await?;
             } else {
-                // Space fallback: use existing space script
-                let space = normalize_space(&space_or_sptr);
-                let space_script =
-                    spaces_protocol::script::SpaceScript::create_set_fallback(data.as_slice());
-
-                cli.send_request(
-                    Some(RpcWalletRequest::Execute(ExecuteParams {
-                        context: vec![space],
-                        space_script,
-                    })),
-                    None,
-                    fee_rate,
-                    false,
-                )
-                .await?;
+                // TODO: support set data for spaces
+                // // Space fallback: use existing space script
+                // let space = normalize_space(&space_or_sptr);
+                // let space_script =
+                //     spaces_protocol::script::create_set_data(data.as_slice());
+                //
+                // cli.send_request(
+                //     Some(RpcWalletRequest::Execute(ExecuteParams {
+                //         context: vec![space],
+                //         space_script,
+                //     })),
+                //     None,
+                //     fee_rate,
+                //     false,
+                // )
+                // .await?;
             }
         }
         Commands::ListUnspent => {
@@ -1095,24 +1116,6 @@ async fn handle_commands(cli: &SpaceCli, command: Commands) -> Result<(), Client
             )
                 .await?
         }
-        Commands::TransferPtr { ptrs, to, fee_rate } => {
-            let mut parsed = Vec::with_capacity(ptrs.len());
-            for ptr in ptrs {
-                parsed.push(Sptr::from_str(&ptr)
-                    .map_err(|e| ClientError::Custom(format!("invalid sptr:{}: {}", ptr, e.to_string())))?);
-            }
-
-            cli.send_request(
-                Some(RpcWalletRequest::TransferPtr(TransferPtrParams {
-                    ptrs: parsed,
-                    to,
-                })),
-                None,
-                fee_rate,
-                false,
-            )
-                .await?
-        }
         Commands::GetPtr { spk } => {
             let sptr = Sptr::from_str(&spk)
                 .map_err(|e| ClientError::Custom(format!("input error: {}", e.to_string())))?;
@@ -1209,6 +1212,7 @@ async fn handle_commands(cli: &SpaceCli, command: Commands) -> Result<(), Client
                 None => return Err(ClientError::Custom("no such space".to_string()))
             };
 
+            use spaces_client::rpc::SpaceOrPtr;
             let label = space_info.spaceout.space.as_ref().expect("space").name.clone();
             let delegation = cli.client.get_delegation(label.clone()).await?;
             if delegation.is_none() {
@@ -1217,9 +1221,10 @@ async fn handle_commands(cli: &SpaceCli, command: Commands) -> Result<(), Client
             let delegation = delegation.unwrap();
 
             cli.send_request(
-                Some(RpcWalletRequest::TransferPtr(TransferPtrParams {
-                    ptrs: vec![delegation],
-                    to,
+                Some(RpcWalletRequest::Transfer(TransferSpacesParams {
+                    spaces: vec![SpaceOrPtr::Ptr(delegation)],
+                    to: Some(to),
+                    data: None,
                 })),
                 None,
                 fee_rate,

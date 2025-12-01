@@ -7,7 +7,7 @@ use spaces_client::{
     },
     wallets::{AddressKind, WalletResponse},
 };
-use spaces_client::rpc::{CommitParams, CreatePtrParams, DelegateParams, SetPtrDataParams, TransferPtrParams, TransferSpacesParams};
+use spaces_client::rpc::{CommitParams, CreatePtrParams, DelegateParams, SetPtrDataParams, SpaceOrPtr, TransferSpacesParams};
 use spaces_client::store::Sha256;
 use spaces_protocol::{bitcoin, bitcoin::{FeeRate}};
 use spaces_protocol::bitcoin::hashes::{sha256, Hash};
@@ -117,13 +117,14 @@ async fn it_should_create_sptrs(rig: &TestRig) -> anyhow::Result<()> {
     let xfer = wallet_do(
         rig,
         ALICE,
-        vec![RpcWalletRequest::TransferPtr(TransferPtrParams {
-            ptrs: vec![sptr0],
-            to: addr1.clone(),
+        vec![RpcWalletRequest::Transfer(TransferSpacesParams {
+            spaces: vec![SpaceOrPtr::Ptr(sptr0)],
+            to: Some(addr1.clone()),
+            data: None,
         })],
         false,
-    ).await.expect("TransferPtr to addr1");
-    assert!(wallet_res_err(&xfer).is_ok(), "TransferPtr must not error");
+    ).await.expect("Transfer PTR to addr1");
+    assert!(wallet_res_err(&xfer).is_ok(), "Transfer PTR must not error");
 
     mine_and_sync(rig, 1).await?;
 
@@ -543,8 +544,9 @@ async fn it_should_reject_duplicate_sptr_delegations(rig: &TestRig) -> anyhow::R
         rig,
         ALICE,
         vec![RpcWalletRequest::Transfer(TransferSpacesParams {
-            spaces: vec![space1_name.to_string()],
+            spaces: vec![SpaceOrPtr::Space(space1_name.clone())],
             to: Some(common_addr.clone()),
+            data: None,
         })],
         false,
     ).await?;
@@ -565,8 +567,9 @@ async fn it_should_reject_duplicate_sptr_delegations(rig: &TestRig) -> anyhow::R
         rig,
         ALICE,
         vec![RpcWalletRequest::Transfer(TransferSpacesParams {
-            spaces: vec![space2_name.to_string()],
+            spaces: vec![SpaceOrPtr::Space(space2_name.clone())],
             to: Some(common_addr.clone()),
+            data: None,
         })],
         false,
     ).await?;
@@ -593,8 +596,9 @@ async fn it_should_reject_duplicate_sptr_delegations(rig: &TestRig) -> anyhow::R
         rig,
         ALICE,
         vec![RpcWalletRequest::Transfer(TransferSpacesParams {
-            spaces: vec![space1_name.to_string()],
+            spaces: vec![SpaceOrPtr::Space(space1_name.clone())],
             to: Some(new_addr),
+            data: None,
         })],
         false,
     ).await?;
@@ -613,8 +617,9 @@ async fn it_should_reject_duplicate_sptr_delegations(rig: &TestRig) -> anyhow::R
         rig,
         ALICE,
         vec![RpcWalletRequest::Transfer(TransferSpacesParams {
-            spaces: vec![space2_name.to_string()],
+            spaces: vec![SpaceOrPtr::Space(space2_name.clone())],
             to: Some(common_addr),
+            data: None,
         })],
         false,
     ).await?;
@@ -679,10 +684,11 @@ async fn it_should_set_and_persist_ptr_data(rig: &TestRig) -> anyhow::Result<()>
     assert!(wallet_res_err(&set_data).is_ok(), "SetPtrData should succeed");
     mine_and_sync(rig, 1).await?;
 
+    use spaces_protocol::Bytes;
     // Verify data was set
     let ptr_with_data = rig.spaced.client.get_ptr(sptr).await?
         .expect("ptr should exist");
-    assert_eq!(ptr_with_data.ptrout.sptr.as_ref().unwrap().data, Some(test_data.clone()), "PTR data should be set");
+    assert_eq!(ptr_with_data.ptrout.sptr.as_ref().unwrap().data, Some(Bytes::new(test_data.clone())), "PTR data should be set");
     println!("✓ PTR data set successfully: {:?}", String::from_utf8_lossy(&test_data));
 
     // Test 3: Transfer PTR without data - data should persist
@@ -691,18 +697,19 @@ async fn it_should_set_and_persist_ptr_data(rig: &TestRig) -> anyhow::Result<()>
     let transfer = wallet_do(
         rig,
         ALICE,
-        vec![RpcWalletRequest::TransferPtr(TransferPtrParams {
-            ptrs: vec![sptr],
-            to: bob_addr.clone(),
+        vec![RpcWalletRequest::Transfer(TransferSpacesParams {
+            spaces: vec![SpaceOrPtr::Ptr(sptr)],
+            to: Some(bob_addr.clone()),
+            data: None,
         })],
         false,
     ).await?;
-    assert!(wallet_res_err(&transfer).is_ok(), "TransferPtr should succeed");
+    assert!(wallet_res_err(&transfer).is_ok(), "Transfer PTR should succeed");
     mine_and_sync(rig, 1).await?;
 
     let ptr_after_transfer = rig.spaced.client.get_ptr(sptr).await?
         .expect("ptr should exist after transfer");
-    assert_eq!(ptr_after_transfer.ptrout.sptr.as_ref().unwrap().data, Some(test_data.clone()),
+    assert_eq!(ptr_after_transfer.ptrout.sptr.as_ref().unwrap().data, Some(Bytes::new(test_data.clone())),
         "PTR data should persist after transfer without new data");
     println!("✓ PTR data persisted after transfer");
 
@@ -723,7 +730,7 @@ async fn it_should_set_and_persist_ptr_data(rig: &TestRig) -> anyhow::Result<()>
 
     let ptr_updated = rig.spaced.client.get_ptr(sptr).await?
         .expect("ptr should exist");
-    assert_eq!(ptr_updated.ptrout.sptr.as_ref().unwrap().data, Some(new_data.clone()), "PTR data should be updated");
+    assert_eq!(ptr_updated.ptrout.sptr.as_ref().unwrap().data, Some(Bytes::new(new_data.clone())), "PTR data should be updated");
     println!("✓ PTR data updated successfully: {:?}", String::from_utf8_lossy(&new_data));
 
     // Test 5: Set empty data
@@ -743,7 +750,7 @@ async fn it_should_set_and_persist_ptr_data(rig: &TestRig) -> anyhow::Result<()>
 
     let ptr_empty = rig.spaced.client.get_ptr(sptr).await?
         .expect("ptr should exist");
-    assert_eq!(ptr_empty.ptrout.sptr.as_ref().unwrap().data, Some(empty_data), "PTR data should be set to empty");
+    assert_eq!(ptr_empty.ptrout.sptr.as_ref().unwrap().data, Some(Bytes::new(empty_data)), "PTR data should be set to empty");
     println!("✓ PTR data set to empty successfully");
 
     Ok(())
@@ -814,9 +821,10 @@ async fn it_should_transfer_ptr_with_n_to_n_rule(rig: &TestRig) -> anyhow::Resul
         // Transfer to addr1 with SAME value (should use n→n rule)
         let addr1 = rig.spaced.client.wallet_get_new_address(BOB, AddressKind::Space).await?;
         wallet_do(rig, ALICE, vec![
-            RpcWalletRequest::TransferPtr(TransferPtrParams {
-                ptrs: vec![sptr],
-                to: addr1.clone(),
+            RpcWalletRequest::Transfer(TransferSpacesParams {
+                spaces: vec![SpaceOrPtr::Ptr(sptr)],
+                to: Some(addr1.clone()),
+                data: None,
             })
         ], false).await?;
         mine_and_sync(rig, 1).await?;
@@ -852,8 +860,16 @@ async fn it_should_transfer_ptr_with_n_to_n_rule(rig: &TestRig) -> anyhow::Resul
         let dest_b = rig.spaced.client.wallet_get_new_address(BOB, AddressKind::Space).await?;
 
         wallet_do(rig, ALICE, vec![
-            RpcWalletRequest::TransferPtr(TransferPtrParams { ptrs: vec![sptr_a], to: dest_a.clone() }),
-            RpcWalletRequest::TransferPtr(TransferPtrParams { ptrs: vec![sptr_b], to: dest_b.clone() }),
+            RpcWalletRequest::Transfer(TransferSpacesParams {
+                spaces: vec![SpaceOrPtr::Ptr(sptr_a)],
+                to: Some(dest_a.clone()),
+                data: None,
+            }),
+            RpcWalletRequest::Transfer(TransferSpacesParams {
+                spaces: vec![SpaceOrPtr::Ptr(sptr_b)],
+                to: Some(dest_b.clone()),
+                data: None,
+            }),
         ], false).await?;
         mine_and_sync(rig, 1).await?;
 

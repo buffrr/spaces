@@ -477,12 +477,8 @@ pub enum RpcWalletRequest {
     Bid(BidParams),
     #[serde(rename = "register")]
     Register(RegisterParams),
-    #[serde(rename = "execute")]
-    Execute(ExecuteParams),
     #[serde(rename = "transfer")]
     Transfer(TransferSpacesParams),
-    #[serde(rename = "transferptr")]
-    TransferPtr(TransferPtrParams),
     #[serde(rename = "createptr")]
     CreatePtr(CreatePtrParams),
     #[serde(rename = "delegate")]
@@ -495,18 +491,56 @@ pub enum RpcWalletRequest {
     SendCoins(SendCoinsParams),
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-pub struct TransferSpacesParams {
-    pub spaces: Vec<String>,
+/// Either a space name or a PTR
+#[derive(Clone, Debug)]
+pub enum SpaceOrPtr {
+    Space(SLabel),
+    Ptr(Sptr),
+}
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub to: Option<String>,
+impl Serialize for SpaceOrPtr {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            SpaceOrPtr::Space(label) => serializer.serialize_str(&label.to_string()),
+            SpaceOrPtr::Ptr(sptr) => serializer.serialize_str(&sptr.to_string()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SpaceOrPtr {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+
+        // Try to parse as SPTR first (starts with "sptr1")
+        if s.starts_with("sptr1") {
+            Sptr::from_str(&s)
+                .map(SpaceOrPtr::Ptr)
+                .map_err(serde::de::Error::custom)
+        } else {
+            // Otherwise parse as space name
+            SLabel::from_str(&s)
+                .map(SpaceOrPtr::Space)
+                .map_err(serde::de::Error::custom)
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct TransferPtrParams {
-    pub ptrs: Vec<Sptr>,
-    pub to: String,
+pub struct TransferSpacesParams {
+    /// List of spaces and/or PTRs to transfer
+    pub spaces: Vec<SpaceOrPtr>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -535,12 +569,6 @@ pub struct SetPtrDataParams {
 pub struct SendCoinsParams {
     pub amount: Amount,
     pub to: String,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct ExecuteParams {
-    pub context: Vec<String>,
-    pub space_script: Vec<u8>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

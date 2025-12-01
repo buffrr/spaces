@@ -7,12 +7,8 @@ use bitcoin::{
     Amount, OutPoint, Transaction, TxOut,
 };
 
-use crate::{
-    errors::Result,
-    hasher::{KeyHasher, SpaceKey},
-    script::{ScriptResult, SpaceScript},
-    SpaceOut,
-};
+use crate::{errors::Result, hasher::{KeyHasher, SpaceKey}, script::{OpenResult}, Bytes, SpaceOut};
+use crate::script::{find_op_set_data, load_open_context, OpenContext};
 
 const COMPRESSED_PSBT_SIZE: usize = 65;
 
@@ -25,13 +21,14 @@ pub struct BidPsbt {
 pub struct TxContext {
     pub inputs: Vec<InputContext>,
     pub auctioned_output: Option<AuctionedOutput>,
+    pub proposed_space: Option<(usize, OpenResult<OpenContext>)>,
+    pub data: Option<Bytes>,
 }
 
 #[derive(Clone)]
 pub struct InputContext {
     pub n: usize,
     pub sstxo: SSTXO,
-    pub script: Option<ScriptResult<SpaceScript>>,
 }
 
 /// Spent Spaces Transaction Output
@@ -75,6 +72,7 @@ impl TxContext {
         src: &mut T,
         tx: &Transaction,
     ) -> Result<Option<TxContext>> {
+        let mut proposed_space = None;
         if !Self::spending_spaces(src, &tx)? {
             if is_magic_lock_time(&tx.lock_time)
                 && tx.output.iter().any(|out| out.is_magic_output())
@@ -84,6 +82,8 @@ impl TxContext {
                     // even if such an output exists, it can be ignored
                     // as there's no spends of existing space outputs
                     auctioned_output: None,
+                    proposed_space,
+                    data: None,
                 }));
             }
             return Ok(None);
@@ -106,22 +106,27 @@ impl TxContext {
             let sstxo = SSTXO {
                 previous_output: spaceout,
             };
-            let mut spacein = InputContext {
+            let spacein = InputContext {
                 n,
                 sstxo,
-                script: None,
             };
 
-            // Run any space scripts
-            if let Some(script) = input.witness.tapscript() {
-                spacein.script = SpaceScript::eval::<T, H>(src, script)?;
+            // Check for a name revealed in the witness
+            if auctioned_output.is_some() && proposed_space.is_none() {
+                if let Some(script) = input.witness.tapscript() {
+                    proposed_space = load_open_context::<T, H>(src, script)?
+                        .map(|o| (n, o));
+                }
             }
+
             inputs.push(spacein)
         }
 
         Ok(Some(TxContext {
             inputs,
             auctioned_output,
+            proposed_space,
+            data: find_op_set_data(&tx.output),
         }))
     }
 
