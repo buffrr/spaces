@@ -3,11 +3,21 @@ name = "spaces_testutil"
 version = "0.0.1"
 edition = "2021"
 
+[[bin]]
+name = "db-dump"
+path = "src/bin/db_dump.rs"
+
 [dependencies]
 bitcoind = { version = "0.36.0", features = ["26_0"] }
 spaces_client = { path = "../client" }
 hyper = "0.14.28"
 assert_cmd = "2.0.16"
+anyhow = "1.0.66"
+hex = "0.4"
+spacedb = { git = "https://github.com/spacesprotocol/spacedb", version = "0.0.7" }
+spaces_protocol = { path = "../protocol", features = ["std", "serde"] }
+bincode = { version = "2.0.1", features = ["serde", "derive"] }
+serde_json = "1.0"
 
 [build-dependencies]
 zip = { version = "0.6" }
