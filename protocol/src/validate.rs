@@ -145,7 +145,8 @@ impl Validator {
                 }
                 Err(e) => {
                     let input =
-                        changeset.spends.get_mut(open_idx).expect("input for open should exist");
+                        changeset.spends.iter_mut().find(|s| s.n == open_idx)
+                            .expect("input for open should exist");
                     input.script_error = Some(e);
                 }
             }

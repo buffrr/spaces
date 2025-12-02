@@ -2398,9 +2398,14 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "bincode",
  "bitcoind",
+ "hex",
  "hyper 0.14.28",
+ "serde_json",
+ "spacedb",
  "spaces_client",
+ "spaces_protocol",
  "zip",
 ]
 
