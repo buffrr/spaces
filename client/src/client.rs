@@ -315,6 +315,14 @@ impl Client {
         for revoked in changeset.revoked_commitments {
             let commitment_key = CommitmentKey::new::<Sha256>(&revoked.space, revoked.commitment.state_root);
             state.remove_commitment(commitment_key);
+
+            let registry_key = RegistryKey::from_slabel::<Sha256>(&revoked.space);
+            if let Some(prev) = revoked.commitment.prev_root {
+                // Points space -> prev commitments tip
+                state.insert_registry(registry_key, prev);
+            } else {
+                state.remove_registry(registry_key);
+            }
         }
 
         // Create new delegations

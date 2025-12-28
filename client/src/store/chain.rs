@@ -300,6 +300,10 @@ impl Chain {
         self.db.pt.state.insert_registry(key, state_root)
     }
 
+    pub(crate) fn remove_registry(&self, key: RegistryKey) {
+        self.db.pt.state.remove_registry(key)
+    }
+
     pub fn remove_ptr_utxo(&mut self, outpoint: OutPoint) {
         let key = OutpointKey::from_outpoint::<Sha256>(outpoint);
         self.db.pt.state.remove(key)
