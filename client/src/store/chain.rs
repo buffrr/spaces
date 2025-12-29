@@ -96,7 +96,7 @@ impl Chain {
     }
 
     pub fn load(_network: Network, genesis: ChainAnchor, ptrs_genesis: ChainAnchor, dir: &Path, index_spaces: bool, index_ptrs: bool) -> anyhow::Result<Self> {
-        let proto_db_path = dir.join("spaces.sdb");
+        let proto_db_path = dir.join("root.sdb");
         let ptrs_db_path = dir.join("refs.sdb");
         let initial_sp_sync = !proto_db_path.exists();
         let initial_pt_sync = !ptrs_db_path.exists();
